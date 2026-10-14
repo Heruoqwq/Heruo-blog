@@ -46,3 +46,21 @@ pnpm run build
 修改前端后运行 `pnpm run build:github`，提交更新后的 `docs/`。后台源代码位于 `app/server/api.ts`，数据库 schema 位于 `db/schema.ts`，迁移位于 `drizzle/`。配套服务使用 Sites 的发布流程部署，GitHub Pages 本身不运行服务端代码。
 
 运行时配置键：`ADMIN_PASSWORD_HASH`（secret）、`BLOG_ALLOWED_ORIGIN`。如果更换域名，须同步后端来源配置及 `github/main.tsx` 的 API 地址。后端项目身份配置位于 `.openai/hosting.json`。
+
+## 可折叠提示块
+
+在文章正文或编辑器中使用：
+
+````markdown
+:::info[code]
+这里可以写 Markdown、$LaTeX$ 公式以及代码：
+
+```cpp
+cout<<1;
+```
+:::
+````
+
+`code` 是可修改的标题。默认收起，点击整行标题可以展开，再次点击收起。未填写标题时显示「提示」。需要默认展开时写 `:::info[标题]{open}`。
+
+也支持 `note`、`tip`、`warning`、`danger` 和 `details`。嵌套提示块时，外层使用四个冒号 `::::`，内层使用三个冒号 `:::`。代码块里的 `:::` 保持原样显示。

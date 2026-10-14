@@ -1,10 +1,7 @@
 "use client";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowUpRight, ArrowLeft, ArrowRight, Search, Plus, X, Check, CheckCheck, Circle, LockKeyhole, BookOpen, ListTodo, PenLine, LogOut, Trash2, FileText, Eye, Upload, Moon, Sun, CodeXml as Github, Loader2, Download, ChevronRight, CalendarDays, Sparkles, Menu } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
+import Markdown from "./markdown";
 type Post = { id: string; title: string; content: string; excerpt: string; category: string; tags: string[]; status: "draft" | "published"; created_at: string; updated_at: string };
 type Task = { id: string; title: string; done: boolean; created_at: string; updated_at: string };
 type Draft = { id?: string; title: string; content: string; excerpt: string; category: string; tagsText: string; status: "draft" | "published" };
@@ -14,9 +11,6 @@ const summary = (p: Post) => p.excerpt || p.content.replace(/[#*`>$\[\]~_]/g, ""
 const date = (d: string, full = false) => new Date(d).toLocaleDateString("zh-CN", { year: "numeric", month: full ? "long" : "2-digit", day: "2-digit" });
 const reading = (s: string) => Math.max(1, Math.ceil(s.length / 500));
 const navigate = (path: string) => { window.location.hash = path; window.scrollTo({ top: 0, behavior: "smooth" }); };
-function Markdown({ content }: { content: string }) {
-  return <div className="markdown"><ReactMarkdown skipHtml remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a>, img: ({ alt, ...props }) => <img {...props} alt={alt || "文章图片"} loading="lazy" referrerPolicy="no-referrer" /> }}>{content}</ReactMarkdown></div>;
-}
 export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
   const [path, setPath] = useState("/");
   const [posts, setPosts] = useState<Post[]>([]);
