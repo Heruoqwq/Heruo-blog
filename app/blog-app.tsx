@@ -1,8 +1,10 @@
 "use client";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowUpRight, ArrowLeft, ArrowRight, Search, Plus, X, Check, BookOpen, ListTodo, PenLine, LogOut, Trash2, FileText, Eye, Upload, Moon, Sun, CodeXml as Github, Loader2, Download, Menu } from "lucide-react";
+import { ArrowUpRight, ArrowLeft, ArrowRight, Search, Plus, X, Check, BookOpen, ListTodo, PenLine, LogOut, Trash2, FileText, Eye, Upload, Moon, Sun, CodeXml as Github, Loader2, Download, Menu, Users } from "lucide-react";
 import Markdown from "./markdown";
-type Post = { id: string; title: string; content: string; excerpt: string; category: string; tags: string[]; status: "draft" | "published"; created_at: string; updated_at: string };
+type User = { id: number; username: string; display_name: string; role: "user" | "superadmin" };
+type Member = User & { disabled: boolean; created_at: string };
+type Post = { author_id: number; author_name: string; id: string; title: string; content: string; excerpt: string; category: string; tags: string[]; status: "draft" | "published"; created_at: string; updated_at: string };
 type Task = { id: string; title: string; done: boolean; created_at: string; updated_at: string };
 type Draft = { id?: string; title: string; content: string; excerpt: string; category: string; tagsText: string; status: "draft" | "published" };
 const emptyDraft = (): Draft => ({ title: "", content: "", excerpt: "", category: "随笔", tagsText: "", status: "draft" });
@@ -17,6 +19,13 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
   const [allPosts, setAllPosts] = useState<Post[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [auth, setAuth] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [users, setUsers] = useState<Member[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState("");
+  const [username, setUsername] = useState("");
+  const [passwordAgain, setPasswordAgain] = useState("");
+  const isSuper = user?.id === 1 && user.role === "superadmin";
   const [authReady, setAuthReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -43,15 +52,17 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const tokenRef = useRef("");
   async function api<T>(route: string, method = "GET", data?: unknown): Promise<T> {
-    const response = await fetch(`${apiBase}/api/${route}`, { method, headers: { ...(data !== undefined ? { "Content-Type": "application/json" } : {}), ...(tokenRef.current ? { Authorization: `Bearer ${tokenRef.current}` } : {}) }, ...(data !== undefined ? { body: JSON.stringify(data) } : {}) });
+    const requestToken = tokenRef.current;
+    const response = await fetch(`${apiBase}/api/${route}`, { method, headers: { ...(data !== undefined ? { "Content-Type": "application/json" } : {}), ...(requestToken ? { Authorization: `Bearer ${requestToken}` } : {}) }, ...(data !== undefined ? { body: JSON.stringify(data) } : {}) });
     const result = await response.json() as T & { error?: string };
     if (!response.ok) {
-      if (response.status === 401 && !route.startsWith("auth/login")) {
-        tokenRef.current = ""; sessionStorage.removeItem(tokenKey); setAuth(false);
+      if (response.status === 401 && !route.startsWith("auth/") && tokenRef.current === requestToken) {
+        tokenRef.current = ""; sessionStorage.removeItem(tokenKey); setAuth(false); setUser(null); setUsers([]); setConfirm(null); setPost(null);
         setTasks([]); setAllPosts([]); setDraft(emptyDraft());
       }
       throw new Error(result.error || "请求失败");
     }
+    if (requestToken && !route.startsWith("auth/") && tokenRef.current !== requestToken) throw new Error("会话已更改，请重试");
     return result;
   }
   async function loadPosts() {
@@ -61,12 +72,13 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
     finally { setLoading(false); }
   }
   async function loadAdmin() {
+    const currentToken = tokenRef.current;
     setAdminLoading(true); setAdminError("");
     try {
       const [p, t] = await Promise.all([api<{ posts: Post[] }>("posts?all=1"), api<{ tasks: Task[] }>("tasks")]);
-      setAllPosts(p.posts); setTasks(t.tasks);
-    } catch (e) { setAdminError((e as Error).message); }
-    finally { setAdminLoading(false); }
+      if (tokenRef.current === currentToken) { setAllPosts(p.posts); setTasks(t.tasks); }
+    } catch (e) { if (tokenRef.current === currentToken) setAdminError((e as Error).message); }
+    finally { if (tokenRef.current === currentToken) setAdminLoading(false); }
   }
   useEffect(() => {
     const route = () => { setPath(window.location.hash.slice(1) || "/"); setMobileMenu(false); };
@@ -75,9 +87,9 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
     setDark(theme); document.documentElement.dataset.theme = theme ? "dark" : "light";
     tokenRef.current = sessionStorage.getItem(tokenKey) || "";
     void loadPosts();
-    void api<{ authenticated: boolean }>("auth/session").then((v) => {
-      setAuth(v.authenticated); if (!v.authenticated) { tokenRef.current = ""; sessionStorage.removeItem(tokenKey); }
-    }).catch(() => { setAuth(false); }).finally(() => setAuthReady(true));
+    void api<{ authenticated: boolean; user: User | null }>("auth/session").then((v) => {
+      setAuth(v.authenticated && Boolean(v.user)); setUser(v.user); if (!v.authenticated) { tokenRef.current = ""; sessionStorage.removeItem(tokenKey); }
+    }).catch(() => { setAuth(false); setUser(null); }).finally(() => setAuthReady(true));
     return () => window.removeEventListener("hashchange", route);
   }, []);
   useEffect(() => { if (auth) void loadAdmin(); }, [auth]);
@@ -90,21 +102,42 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
     let alive = true; setPostLoading(true); setPostError(""); setPost(null);
     void api<{ post: Post }>(`posts/${id}`).then((v) => { if (alive) setPost(v.post); }).catch((e) => { if (alive) setPostError(e.message); }).finally(() => { if (alive) setPostLoading(false); });
     return () => { alive = false; };
-  }, [path]);
+  }, [path, user?.id]);
   useEffect(() => { document.title = post && path.startsWith("/post/") ? `${post.title} · Heruo 博客` : "Heruo 博客"; }, [post, path]);
   const notifyError = (e: unknown) => setToast((e as Error).message || "操作失败");
   async function login(e: FormEvent) {
-    e.preventDefault(); setBusy(true); setLoginError("");
+    e.preventDefault();
+    const register = path === "/register";
+    setLoginError("");
+    if (register && password !== passwordAgain) { setLoginError("两次密码不一致"); return; }
+    setBusy(true);
     try {
-      const v = await api<{ token: string }>("auth/login", "POST", { password });
-      tokenRef.current = v.token; sessionStorage.setItem(tokenKey, v.token); setPassword(""); setAuth(true); setToast("登录成功");
+      const v = await api<{ token: string; user: User }>(register ? "auth/register" : "auth/login", "POST", { username, password });
+      tokenRef.current = v.token; sessionStorage.setItem(tokenKey, v.token);
+      setUser(v.user); setAuth(true); setPassword(""); setPasswordAgain(""); setPanel("tasks");
+      setToast(register ? "注册成功" : "登录成功"); navigate("/admin");
     } catch (e) { setLoginError((e as Error).message); }
     finally { setBusy(false); }
+  }
+  async function loadUsers() {
+    const currentToken = tokenRef.current;
+    setUsersLoading(true); setUsersError("");
+    try {
+      const v = await api<{ users: Member[] }>("users");
+      if (tokenRef.current === currentToken) setUsers(v.users);
+    } catch (e) { if (tokenRef.current === currentToken) setUsersError((e as Error).message); }
+    finally { if (tokenRef.current === currentToken) setUsersLoading(false); }
+  }
+  function toggleUser(member: Member) {
+    setConfirm({ label: (member.disabled ? "启用" : "停用") + "账号「" + member.display_name + "」？", action: async () => {
+      await api("users/" + member.id, "PATCH", { disabled: !member.disabled });
+      await loadUsers(); setToast(member.disabled ? "已启用" : "已停用");
+    } });
   }
   async function logout() {
     try { await api("auth/logout", "POST"); }
     catch (e) { notifyError(e); return; }
-    tokenRef.current = ""; sessionStorage.removeItem(tokenKey); setAuth(false); setTasks([]); setAllPosts([]); setDraft(emptyDraft()); setPost(null); navigate("/"); setToast("已退出");
+    tokenRef.current = ""; sessionStorage.removeItem(tokenKey); setAuth(false); setUser(null); setUsers([]); setConfirm(null); setPanel("tasks"); setTaskTitle(""); setLoginError(""); setTasks([]); setAllPosts([]); setDraft(emptyDraft()); setPost(null); navigate("/"); setToast("已退出");
   }
   async function savePost(status: "draft" | "published") {
     if (!draft.title.trim() || !draft.content.trim()) { setToast("请填写标题和正文"); return; }
@@ -146,31 +179,45 @@ export default function BlogApp({ apiBase = "" }: { apiBase?: string }) {
   const visiblePosts = posts.filter((p) => (category === "全部" || p.category === category) && `${p.title} ${p.excerpt} ${p.content} ${p.tags.join(" ")}`.toLowerCase().includes(query.toLowerCase()));
   const pending = tasks.filter((t) => !t.done).length;
   const visibleTasks = tasks.filter((t) => taskFilter === "all" || (taskFilter === "done" ? t.done : !t.done));
-  const adminPage = path.startsWith("/admin");
+  const registerPage = path === "/register";
+  const adminPage = path.startsWith("/admin") || path === "/login" || registerPage;
   const postPage = path.startsWith("/post/");
   const archive = path === "/archive";
   const about = path === "/about";
+  useEffect(() => { setLoginError(""); setPassword(""); setPasswordAgain(""); }, [path]);
+  useEffect(() => { if (isSuper && panel === "users") void loadUsers(); }, [isSuper, panel]);
   const loader = <div className="empty-state"><Loader2 className="spin" /><p>正在加载…</p></div>;
   return <div className="site">
     <header className="header"><div className="header-inner"><a className="brand" href="#/">Heruo 博客</a>
       <nav className={mobileMenu ? "main-nav mobile-open" : "main-nav"} aria-label="主导航"><a className={!adminPage && !archive && !about ? "active" : ""} href="#/">文章</a><a className={archive ? "active" : ""} href="#/archive">归档</a><a className={about ? "active" : ""} href="#/about">关于</a></nav>
-      <div className="header-actions"><button className="icon-button theme-button" onClick={toggleTheme} aria-label={dark ? "切换浅色模式" : "切换深色模式"}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button><a className={`admin-link ${adminPage ? "selected" : ""}`} href="#/admin">{auth ? "后台" : "登录"}<ArrowUpRight size={15} /></a><button className="icon-button menu-button" aria-label="打开导航" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button></div>
+      <div className="header-actions"><button className="icon-button theme-button" onClick={toggleTheme} aria-label={dark ? "切换浅色模式" : "切换深色模式"}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button><a className={`admin-link ${adminPage ? "selected" : ""}`} href="#/admin">{auth ? "我的" : "登录"}<ArrowUpRight size={15} /></a>{!auth && <a className="register-link" href="#/register">注册</a>}<button className="icon-button menu-button" aria-label="打开导航" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button></div>
     </div></header>
     <main>
-      {adminPage ? !authReady ? loader : !auth ? <section className="login-wrap"><form className="login-form" onSubmit={login}><h1>登录</h1><label htmlFor="password">密码</label><input id="password" type="password" autoComplete="current-password" placeholder="密码" value={password} onChange={(e) => setPassword(e.target.value)} required maxLength={200}/>{loginError && <p className="field-error" role="alert">{loginError}</p>}<button className="button primary full" type="submit" disabled={busy}>{busy ? <Loader2 size={18} className="spin"/> : <>登录<ArrowRight size={17}/></>}</button><a className="back-link" href="#/"><ArrowLeft size={14}/>返回</a></form></section> : <section className="workspace"><aside className="workspace-sidebar"><h2>后台</h2><button className={panel === "tasks" ? "sidebar-item active" : "sidebar-item"} onClick={() => setPanel("tasks")}><ListTodo size={18}/>待办清单<span className="sidebar-count">{pending}</span></button><button className={panel === "posts" ? "sidebar-item active" : "sidebar-item"} onClick={() => setPanel("posts")}><FileText size={18}/>文章管理</button><button className={panel === "editor" ? "sidebar-item active" : "sidebar-item"} onClick={newPost}><PenLine size={18}/>写文章</button><div className="sidebar-bottom"><button className="sidebar-item" onClick={() => void logout()}><LogOut size={17}/>退出</button></div></aside><div className="workspace-content">
+      {adminPage ? !authReady ? loader : !auth ? <section className="login-wrap"><form className="login-form" onSubmit={login}>
+        <h1>{registerPage ? "注册" : "登录"}</h1>
+        <label htmlFor="username">{registerPage ? "用户名" : "用户名 / ID"}</label>
+        <input id="username" autoComplete="username" placeholder={registerPage ? "字母开头，3–24 位" : "用户名或 ID"} value={username} onChange={(e) => setUsername(e.target.value)} required maxLength={24} pattern={registerPage ? "[A-Za-z][A-Za-z0-9_]{2,23}" : undefined}/>
+        <label htmlFor="password">密码</label>
+        <input id="password" type="password" autoComplete={registerPage ? "new-password" : "current-password"} placeholder={registerPage ? "至少 8 位" : "密码"} value={password} onChange={(e) => setPassword(e.target.value)} required minLength={registerPage ? 8 : 1} maxLength={200}/>
+        {registerPage && <><label htmlFor="password-again">确认密码</label><input id="password-again" type="password" autoComplete="new-password" placeholder="确认密码" value={passwordAgain} onChange={(e) => setPasswordAgain(e.target.value)} required minLength={8} maxLength={200}/></>}
+        {loginError && <p className="field-error" role="alert">{loginError}</p>}
+        <button className="button primary full" type="submit" disabled={busy}>{busy ? <Loader2 size={18} className="spin"/> : registerPage ? "注册" : "登录"}</button>
+        <div className="auth-links"><a href={registerPage ? "#/admin" : "#/register"}>{registerPage ? "登录" : "注册"}</a><a href="#/">返回</a></div>
+      </form></section> : <section className="workspace"><aside className="workspace-sidebar"><div className="account-summary"><strong>{user?.display_name}</strong><span>ID {user?.id} · {isSuper ? "超级管理员" : "用户"}</span></div><button className={panel === "tasks" ? "sidebar-item active" : "sidebar-item"} onClick={() => setPanel("tasks")}><ListTodo size={18}/>待办清单<span className="sidebar-count">{pending}</span></button><button className={panel === "posts" ? "sidebar-item active" : "sidebar-item"} onClick={() => setPanel("posts")}><FileText size={18}/>文章管理</button><button className={panel === "editor" ? "sidebar-item active" : "sidebar-item"} onClick={newPost}><PenLine size={18}/>写文章</button>{isSuper && <button className={panel === "users" ? "sidebar-item active" : "sidebar-item"} onClick={() => setPanel("users")}><Users size={18}/>用户管理</button>}<div className="sidebar-bottom"><button className="sidebar-item" onClick={() => void logout()}><LogOut size={17}/>退出</button></div></aside><div className="workspace-content">
         {adminError && <div className="error-banner" role="alert">{adminError}<button onClick={() => void loadAdmin()}>重试</button></div>}
         {panel === "tasks" && <><div className="workspace-heading"><div><h1>待办</h1></div></div><div className="task-overview"><div><span>待完成</span><strong>{pending.toString().padStart(2, "0")}</strong></div><div><span>已完成</span><strong>{(tasks.length - pending).toString().padStart(2, "0")}</strong></div></div><form className="task-add" onSubmit={addTask}><Plus size={20}/><input aria-label="新任务" value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)} maxLength={250} placeholder="任务名称" required/><button className="button primary" disabled={taskBusy} type="submit">{taskBusy ? <Loader2 size={16} className="spin"/> : "添加"}</button></form><div className="task-toolbar"><div className="segmented">{[["active", "待完成"], ["done", "已完成"], ["all", "全部"]].map(([v, label]) => <button key={v} className={taskFilter === v ? "active" : ""} onClick={() => setTaskFilter(v)}>{label}</button>)}</div><span>{visibleTasks.length} 个任务</span></div>{adminLoading ? loader : visibleTasks.length ? <div className="task-list">{visibleTasks.map((t) => <div key={t.id} className={`task-row ${t.done ? "done" : ""}`}><button className="task-check" aria-label={t.done ? "撤销完成" : "完成任务"} aria-pressed={t.done} disabled={taskBusy} onClick={() => void toggleTask(t)}>{t.done && <Check size={15}/>}</button><div><strong>{t.title}</strong><small>{date(t.created_at)}</small></div><button className="icon-button delete-button" aria-label={`删除任务 ${t.title}`} disabled={taskBusy} onClick={() => deleteTask(t)}><Trash2 size={16}/></button></div>)}</div> : <div className="empty-state task-empty"><h3>{taskFilter === "done" ? "暂无已完成任务" : taskFilter === "active" ? "暂无待办" : "暂无任务"}</h3></div>}</>}
-        {panel === "posts" && <><div className="workspace-heading"><div><h1>文章管理</h1></div><button className="button primary" onClick={newPost}><Plus size={17}/>新建文章</button></div><div className="management-summary"><span>{allPosts.length} 篇文章</span><span><span className="status-dot"/>{allPosts.filter((p) => p.status === "published").length} 已发布</span><span>{allPosts.filter((p) => p.status === "draft").length} 草稿</span></div>{adminLoading ? loader : allPosts.length ? <div className="management-list">{allPosts.map((p) => <div className="manage-row" key={p.id}><span className="manage-icon"><FileText size={20}/></span><div><button className="text-button manage-title" onClick={() => editPost(p)}>{p.title}</button><p>{date(p.created_at)}<span>·</span>{p.category}</p></div><span className={`post-status ${p.status}`}>{p.status === "published" ? "已发布" : "草稿"}</span><button className="icon-button" aria-label="编辑文章" onClick={() => editPost(p)}><PenLine size={16}/></button><button className="icon-button" aria-label="导出文章" onClick={() => exportMarkdown(p)}><Download size={16}/></button><button className="icon-button delete-button" aria-label="删除文章" onClick={() => deletePost(p)}><Trash2 size={16}/></button></div>)}</div> : <div className="empty-state"><BookOpen size={30}/><h3>暂无文章</h3><button className="button primary" onClick={newPost}>新建文章<ArrowRight size={16}/></button></div>}</>}
+        {panel === "posts" && <><div className="workspace-heading"><div><h1>文章管理</h1></div><button className="button primary" onClick={newPost}><Plus size={17}/>新建文章</button></div><div className="management-summary"><span>{allPosts.length} 篇文章</span><span><span className="status-dot"/>{allPosts.filter((p) => p.status === "published").length} 已发布</span><span>{allPosts.filter((p) => p.status === "draft").length} 草稿</span></div>{adminLoading ? loader : allPosts.length ? <div className="management-list">{allPosts.map((p) => <div className="manage-row" key={p.id}><span className="manage-icon"><FileText size={20}/></span><div><button className="text-button manage-title" onClick={() => editPost(p)}>{p.title}</button><p>{p.author_name}<span>·</span>{date(p.created_at)}<span>·</span>{p.category}</p></div><span className={`post-status ${p.status}`}>{p.status === "published" ? "已发布" : "草稿"}</span><button className="icon-button" aria-label="编辑文章" onClick={() => editPost(p)}><PenLine size={16}/></button><button className="icon-button" aria-label="导出文章" onClick={() => exportMarkdown(p)}><Download size={16}/></button><button className="icon-button delete-button" aria-label="删除文章" onClick={() => deletePost(p)}><Trash2 size={16}/></button></div>)}</div> : <div className="empty-state"><BookOpen size={30}/><h3>暂无文章</h3><button className="button primary" onClick={newPost}>新建文章<ArrowRight size={16}/></button></div>}</>}
+        {panel === "users" && isSuper && <><div className="workspace-heading"><h1>用户管理</h1><button className="button secondary" onClick={() => void loadUsers()}>刷新</button></div>{usersError && <p className="field-error" role="alert">{usersError}</p>}{usersLoading ? loader : <div className="member-list">{users.map((member) => <div className="member-row" key={member.id}><div><strong>{member.display_name}</strong><small>ID {member.id} · {member.username}</small></div><span className="member-role">{member.role === "superadmin" ? "超级管理员" : member.disabled ? "已停用" : "用户"}</span>{member.id !== 1 && <button className="button secondary" disabled={busy} onClick={() => toggleUser(member)}>{member.disabled ? "启用" : "停用"}</button>}</div>)}</div>}</>}
         {panel === "editor" && <><div className="workspace-heading editor-heading"><div><h1>{draft.id ? "编辑文章" : "写文章"}</h1></div><div className="editor-actions"><button className="button secondary" disabled={busy} onClick={() => void savePost("draft")}>保存草稿</button><button className="button primary" disabled={busy} onClick={() => void savePost("published")}>{busy ? <Loader2 size={16} className="spin"/> : <><ArrowUpRight size={16}/>{draft.status === "published" ? "更新" : "发布"}</>}</button></div></div><div className="editor-card"><input className="title-input" aria-label="文章标题" placeholder="文章标题" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} maxLength={150}/><div className="editor-meta"><label>分类<input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} placeholder="随笔" maxLength={30}/></label><label>标签<input value={draft.tagsText} onChange={(e) => setDraft({ ...draft, tagsText: e.target.value })} placeholder="标签（逗号分隔）"/></label></div><label className="excerpt-label">摘要<textarea value={draft.excerpt} onChange={(e) => setDraft({ ...draft, excerpt: e.target.value })} placeholder="摘要（选填）" maxLength={400} rows={2}/></label><div className="editor-toolbar"><span>正文</span><div className="editor-tools"><button className="text-button" onClick={() => fileRef.current?.click()}><Upload size={14}/>导入</button><input ref={fileRef} type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden onChange={async (e) => { const f = e.target.files?.[0]; if (!f) return; if (f.size > 500000) { setToast("文件不能超过 500 KB。"); return; } const text = await f.text(); setDraft((d) => ({ ...d, content: text, title: d.title || text.match(/^#\s+(.+)$/m)?.[1] || f.name.replace(/\.[^.]+$/, "") })); e.target.value = ""; }}/><div className="segmented compact">{[["write", "编辑"], ["split", "分屏"], ["preview", "预览"]].map(([v, l]) => <button key={v} className={view === v ? "active" : ""} onClick={() => setView(v)}>{l}</button>)}</div></div></div><div className={`editor-body ${view}`}>{view !== "preview" && <textarea className="markdown-input" aria-label="正文" spellCheck={false} placeholder="正文" value={draft.content} onChange={(e) => setDraft({ ...draft, content: e.target.value })} maxLength={150000} onKeyDown={(e) => { if (e.key === "Tab") { e.preventDefault(); const el = e.currentTarget; const s = el.selectionStart, end = el.selectionEnd; const next = draft.content.slice(0, s) + "    " + draft.content.slice(end); setDraft({ ...draft, content: next }); requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = s + 4; }); } }}/>}{view !== "write" && <div className="markdown-preview"><span className="preview-label"><Eye size={12}/>预览</span>{draft.content ? <Markdown content={draft.content}/> : <p className="preview-empty">暂无内容</p>}</div>}</div><div className="editor-footer"><span>{draft.content.length.toLocaleString()} 字符</span><span>{draft.id ? (draft.status === "published" ? "已发布" : "草稿") : "未保存"}</span></div></div></>}
       </div></section>
-      : postPage ? <section className="reading-page"><a href="#/" className="back-link"><ArrowLeft size={15}/>返回</a>{postLoading ? loader : postError ? <div className="empty-state"><h2>文章不存在</h2><p>{postError}</p></div> : post && <article><div className="article-kicker"><span className="category-label">{post.category}</span><span>{date(post.created_at, true)}</span><span>{reading(post.content)} 分钟阅读</span>{post.status === "draft" && <span className="post-status draft">草稿</span>}</div><h1>{post.title}</h1>{post.excerpt && <p className="article-excerpt">{post.excerpt}</p>}<div className="article-author"><span className="avatar">H</span><div><strong>Heruo</strong></div>{auth && <button className="button secondary" onClick={() => editPost(post)}><PenLine size={14}/>编辑文章</button>}</div><Markdown content={post.content}/><div className="article-bottom"><div className="tags">{post.tags.map((t) => <span key={t}>#{t}</span>)}</div><button className="text-button" onClick={() => exportMarkdown(post)}><Download size={14}/>导出</button></div><div className="article-end"><a href="#/">文章列表<ArrowRight size={14}/></a></div></article>}</section>
+      : postPage ? <section className="reading-page"><a href="#/" className="back-link"><ArrowLeft size={15}/>返回</a>{postLoading ? loader : postError ? <div className="empty-state"><h2>文章不存在</h2><p>{postError}</p></div> : post && <article><div className="article-kicker"><span className="category-label">{post.category}</span><span>{date(post.created_at, true)}</span><span>{reading(post.content)} 分钟阅读</span>{post.status === "draft" && <span className="post-status draft">草稿</span>}</div><h1>{post.title}</h1>{post.excerpt && <p className="article-excerpt">{post.excerpt}</p>}<div className="article-author"><span className="avatar">{post.author_name.slice(0, 1)}</span><div><strong>{post.author_name}</strong><small>ID {post.author_id}</small></div>{auth && (isSuper || user?.id === post.author_id) && <button className="button secondary" onClick={() => editPost(post)}><PenLine size={14}/>编辑文章</button>}</div><Markdown content={post.content}/><div className="article-bottom"><div className="tags">{post.tags.map((t) => <span key={t}>#{t}</span>)}</div><button className="text-button" onClick={() => exportMarkdown(post)}><Download size={14}/>导出</button></div><div className="article-end"><a href="#/">文章列表<ArrowRight size={14}/></a></div></article>}</section>
       : about ? <section className="about-page"><h1>关于</h1><p>Heruo 博客</p><a className="text-button" href="https://github.com/Heruoqwq/Heruo-blog" target="_blank" rel="noopener noreferrer"><Github size={16}/>源码<ArrowUpRight size={14}/></a></section>
       : <div className="public-content"><section className="articles-section" id="articles"><div className="section-header"><div><h2>{archive ? "归档" : "文章"}<span className="count-badge">{posts.length}</span></h2></div><label className="search-box"><Search size={16}/><input aria-label="搜索文章" placeholder="搜索" value={query} onChange={(e) => setQuery(e.target.value)}/>{query && <button className="icon-button" aria-label="清空搜索" onClick={() => setQuery("")}><X size={14}/></button>}</label></div><div className="category-tabs">{categories.map((c) => <button className={category === c ? "active" : ""} onClick={() => setCategory(c)} key={c}>{c}</button>)}</div>
-      {loading ? loader : loadError ? <div className="empty-state" role="alert"><p>{loadError}</p><button className="button secondary" onClick={() => void loadPosts()}>重试</button></div> : visiblePosts.length ? archive ? <div className="archive-list">{[...new Set(visiblePosts.map((p) => new Date(p.created_at).getFullYear()))].map((year) => <div className="archive-year" key={year}><h3>{year}<span>{visiblePosts.filter((p) => new Date(p.created_at).getFullYear() === year).length} 篇</span></h3>{visiblePosts.filter((p) => new Date(p.created_at).getFullYear() === year).map((p) => <a className="archive-row" key={p.id} href={`#/post/${p.id}`}><span>{date(p.created_at).slice(5)}</span><strong>{p.title}</strong><span className="archive-category">{p.category}</span><ArrowUpRight size={17}/></a>)}</div>)}</div> : <div className="post-list">{visiblePosts.map((p) => <a className="post-card" key={p.id} href={`#/post/${p.id}`}><div className="post-card-content"><div className="post-meta"><span className="category-label">{p.category}</span><span>{date(p.created_at)}</span><span>{reading(p.content)} 分钟阅读</span></div><h3>{p.title}</h3><p>{summary(p)}</p><div className="tags">{p.tags.map((t) => <span key={t}>#{t}</span>)}</div></div><span className="post-arrow"><ArrowUpRight size={22}/></span></a>)}</div> : <div className="empty-state"><BookOpen size={29}/><h3>{posts.length ? "未找到文章" : "暂无文章"}</h3>{!posts.length && <a className="button secondary" href="#/admin">新建文章<PenLine size={15}/></a>}</div>}
+      {loading ? loader : loadError ? <div className="empty-state" role="alert"><p>{loadError}</p><button className="button secondary" onClick={() => void loadPosts()}>重试</button></div> : visiblePosts.length ? archive ? <div className="archive-list">{[...new Set(visiblePosts.map((p) => new Date(p.created_at).getFullYear()))].map((year) => <div className="archive-year" key={year}><h3>{year}<span>{visiblePosts.filter((p) => new Date(p.created_at).getFullYear() === year).length} 篇</span></h3>{visiblePosts.filter((p) => new Date(p.created_at).getFullYear() === year).map((p) => <a className="archive-row" key={p.id} href={`#/post/${p.id}`}><span>{date(p.created_at).slice(5)}</span><strong>{p.title}</strong><span className="archive-category">{p.category}</span><ArrowUpRight size={17}/></a>)}</div>)}</div> : <div className="post-list">{visiblePosts.map((p) => <a className="post-card" key={p.id} href={`#/post/${p.id}`}><div className="post-card-content"><div className="post-meta"><span className="category-label">{p.category}</span><span>{date(p.created_at)}</span><span>{p.author_name}</span><span>{reading(p.content)} 分钟阅读</span></div><h3>{p.title}</h3><p>{summary(p)}</p><div className="tags">{p.tags.map((t) => <span key={t}>#{t}</span>)}</div></div><span className="post-arrow"><ArrowUpRight size={22}/></span></a>)}</div> : <div className="empty-state"><BookOpen size={29}/><h3>{posts.length ? "未找到文章" : "暂无文章"}</h3>{!posts.length && <a className="button secondary" href="#/admin">新建文章<PenLine size={15}/></a>}</div>}
       {!archive && posts.length > 0 && <a className="all-posts-link" href="#/archive">全部归档<ArrowRight size={15}/></a>}</section></div>}
     </main>
     <footer className="footer"><div><span>© {new Date().getFullYear()} Heruo</span></div><a href="https://github.com/Heruoqwq/Heruo-blog" target="_blank" rel="noopener noreferrer"><Github size={16}/>源码<ArrowUpRight size={13}/></a></footer>
     {toast && <div className="toast" role="status">{toast}<button className="icon-button" onClick={() => setToast("")} aria-label="关闭提示"><X size={15}/></button></div>}
-    {confirm && <div className="modal-backdrop" onClick={() => !busy && setConfirm(null)}><div className="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-label" onClick={(e) => e.stopPropagation()}><span className="delete-modal-icon"><Trash2 size={25}/></span><h2 id="confirm-label">{confirm.label}</h2><div><button className="button secondary" autoFocus disabled={busy} onClick={() => setConfirm(null)}>取消</button><button className="button danger" disabled={busy} onClick={async () => { setBusy(true); try { await confirm.action(); setConfirm(null); } catch (e) { notifyError(e); } finally { setBusy(false); } }}>{busy ? <Loader2 size={16} className="spin"/> : "确认删除"}</button></div></div></div>}
+    {confirm && <div className="modal-backdrop" onClick={() => !busy && setConfirm(null)}><div className="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-label" onClick={(e) => e.stopPropagation()}><span className="delete-modal-icon"><Trash2 size={25}/></span><h2 id="confirm-label">{confirm.label}</h2><div><button className="button secondary" autoFocus disabled={busy} onClick={() => setConfirm(null)}>取消</button><button className={panel === "users" ? "button primary" : "button danger"} disabled={busy} onClick={async () => { setBusy(true); try { await confirm.action(); setConfirm(null); } catch (e) { notifyError(e); } finally { setBusy(false); } }}>{busy ? <Loader2 size={16} className="spin"/> : panel === "users" ? "确认" : "确认删除"}</button></div></div></div>}
   </div>;
 }

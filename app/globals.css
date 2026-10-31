@@ -88,3 +88,19 @@
  .task-add input{font-size:13px}
  .footer{padding:20px;font-size:11px}
 }
+.register-link{font-size:13px;color:var(--muted);white-space:nowrap}
+.register-link:hover,.auth-links a:hover{color:var(--purple)}
+.auth-links{display:flex;width:100%;justify-content:space-between;margin-top:24px;font-size:13px;color:var(--muted)}
+.account-summary{margin:0 12px 24px;display:flex;flex-direction:column;gap:4px;overflow-wrap:anywhere}
+.account-summary strong{font-size:15px;font-weight:600}
+.account-summary>span{font-size:11px;color:var(--muted)}
+.member-list{border-top:1px solid var(--line)}
+.member-row{display:flex;gap:20px;align-items:center;padding:20px 0;border-bottom:1px solid var(--line)}
+.member-row>div{flex:1;min-width:0;overflow-wrap:anywhere}
+.member-row strong{font-size:14px}
+.member-row small{display:block;color:var(--muted);font-size:12px}
+.member-role{color:var(--muted);font-size:12px}
+.member-row .button{padding:7px 12px}
+.login-form label:not(:first-of-type){margin-top:16px}
+@media(max-width:760px){.account-summary{width:100%;margin:0 8px 10px}.account-summary strong{font-size:14px}.account-summary>span{font-size:11px}.sidebar-bottom{margin-left:auto}.workspace-sidebar{gap:5px}}
+@media(max-width:540px){.header-actions{gap:6px}.register-link{font-size:12px;padding:0 4px}.sidebar-item{font-size:11px;padding:8px}.member-row{gap:12px}.member-role{font-size:11px}}
