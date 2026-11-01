@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 import "katex/dist/katex.min.css";
 export const metadata: Metadata = {
-  title: "Heruo 博客",
-  description: "Heruo 博客",
+  title: "Heruo OJ",
+  description: "Heruo OJ",
   icons: { icon: "/favicon.svg" },
 };
 export default function RootLayout({ children }: { children: React.ReactNode }) {
