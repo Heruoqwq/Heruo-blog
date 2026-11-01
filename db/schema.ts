@@ -20,6 +20,7 @@ export const posts = sqliteTable("posts", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
   authorId: integer("author_id").references(() => users.id),
+  featured: integer("featured").notNull().default(0),
 }, (t) => [index("posts_status_date").on(t.status, t.createdAt), index("posts_author_date").on(t.authorId, t.createdAt)]);
 export const tasks = sqliteTable("tasks", {
   id: text("id").primaryKey(),
@@ -52,6 +53,13 @@ export const ojProblems = sqliteTable("oj_problems", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
+export const ojFiles = sqliteTable("oj_files", {
+  id: text("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id),
+  name: text("name").notNull(),
+  size: integer("size").notNull(),
+  createdAt: text("created_at").notNull(),
+});
 export const ojCases = sqliteTable("oj_cases", {
   id: text("id").primaryKey(),
   problemId: integer("problem_id").notNull().references(() => ojProblems.id),
@@ -59,6 +67,8 @@ export const ojCases = sqliteTable("oj_cases", {
   input: text("input").notNull(),
   output: text("output").notNull(),
   weight: integer("weight").notNull().default(1),
+  inputFile: text("input_file").references(() => ojFiles.id),
+  outputFile: text("output_file").references(() => ojFiles.id),
 }, (t) => [index("oj_cases_problem").on(t.problemId, t.position)]);
 export const ojSubmissions = sqliteTable("oj_submissions", {
   id: text("id").primaryKey(),

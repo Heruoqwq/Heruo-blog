@@ -29,14 +29,17 @@ function setup(t,legacy=false){
   async run(){return sqlite.prepare(this.sql).run(...this.values);}
  }
  const db={prepare(sql){return new Prepared(sql);},async batch(qs){sqlite.exec('BEGIN');try{const out=qs.map(q=>sqlite.prepare(q.sql).run(...q.values));sqlite.exec('COMMIT');return out;}catch(e){sqlite.exec('ROLLBACK');throw e;}}};
- const env={DB:db,ADMIN_PASSWORD_HASH:hash,BLOG_ALLOWED_ORIGIN:'https://heruoqwq.github.io'};
+ const objects=new Map();
+ const bucket={async put(key,value){objects.set(key,new Uint8Array(value));},async delete(key){objects.delete(key);},async get(key,options){let value=objects.get(key);if(!value)return null;if(options?.range)value=value.slice(options.range.offset,options.range.offset+options.range.length);return{body:new Blob([value]).stream(),async text(){return new TextDecoder().decode(value);}};}};
+ const env={DB:db,BUCKET:bucket,ADMIN_PASSWORD_HASH:hash,BLOG_ALLOWED_ORIGIN:'https://heruoqwq.github.io'};
  async function request(path,method='GET',data,token='',origin='https://heruoqwq.github.io',ip='test-ip'){
-  const res=await handleApi(new Request('https://blog.example/api/'+path,{method,headers:{Origin:origin,'CF-Connecting-IP':ip,...(data!==undefined?{'Content-Type':'application/json'}:{}),...(token?{Authorization:'Bearer '+token}:{})},...(data!==undefined?{body:JSON.stringify(data)}:{})}),env);
-  return {status:res.status,headers:res.headers,data:res.status===204?null:await res.json()};
+  const binary=data instanceof Blob;
+  const res=await handleApi(new Request('https://blog.example/api/'+path,{method,headers:{Origin:origin,'CF-Connecting-IP':ip,...(data!==undefined?{'Content-Type':binary?'application/octet-stream':'application/json'}:{}),...(token?{Authorization:'Bearer '+token}:{})},...(data!==undefined?{body:binary?data:JSON.stringify(data)}:{})}),env);
+  return {status:res.status,headers:res.headers,data:res.status===204?null:res.headers.get("Content-Type")?.startsWith("application/octet-stream")?await res.text():await res.json()};
  }
  const register=async(name)=>{const r=await request('auth/register','POST',{username:name,password});assert.equal(r.status,201);return r.data;};
  const owner=async()=>{const r=await request('auth/login','POST',{username:'1',password});assert.equal(r.status,200);return r.data;};
- return {request,register,owner,sqlite,postId,taskId,oldToken};
+ return {request,register,owner,sqlite,postId,taskId,oldToken,env,objects};
 }
 test('Owner is reserved as ID 1; legacy articles, tasks and sessions remain owned by Heruo',async(t)=>{
  const {request,register,owner,postId,taskId,oldToken}=setup(t,true);
@@ -377,4 +380,121 @@ test('Retry atomically clears old task tokens before dispatch so concurrent read
  assert.equal(during,'QUEUED');
  assert.equal(retried.data.submission.status,'JUDGING');
  assert.equal((await request('oj/submissions/'+id,'GET',undefined,a.token)).data.submission.status,'AC');
+});
+test('Only superadmin recommends published articles; authors keep ownership and drafts leave the main feed',async(t)=>{
+ const {request,register,owner}=setup(t);
+ const alice=await register('Alice'),admin=await owner();
+ assert.equal((await request('posts','POST',{...input,status:'published',featured:true},alice.token)).status,403);
+ const created=await request('posts','POST',{...input,status:'published'},alice.token);
+ const id=created.data.post.id;
+ assert.equal(created.data.post.featured,false);
+ assert.equal((await request('posts/'+id+'/feature','PATCH',{featured:true},alice.token)).status,403);
+ assert.equal((await request('posts/'+id+'/feature','PATCH',{featured:true},admin.token)).status,200);
+ assert.equal((await request('posts/'+id)).data.post.featured,true);
+ assert.equal((await request('posts/'+id,'PATCH',{...input,status:'published',title:'New title'},alice.token)).data.post.featured,true);
+ assert.equal((await request('posts/'+id,'PATCH',{...input,status:'published',featured:false},alice.token)).status,403);
+ assert.equal((await request('profiles/'+alice.user.id)).data.posts[0].id,id);
+ assert.equal((await request('posts/'+id,'PATCH',input,alice.token)).status,200);
+ assert.equal((await request('profiles/'+alice.user.id)).data.posts.length,0);
+ assert.equal((await request('posts/'+id+'/feature','PATCH',{featured:true},admin.token)).status,400);
+ assert.equal((await request('posts/'+id,'GET',undefined,admin.token)).data.post.featured,false);
+ const made=await request('posts','POST',{...input,status:'published',featured:true},admin.token);
+ assert.equal(made.data.post.featured,true);
+});
+test('Profiles contain all public articles and distinct accepted public problems without exposing private records',async(t)=>{
+ const {request,register,owner,sqlite}=setup(t);
+ const alice=await register('Alice'),admin=await owner();
+ const p=await request('oj/problems','POST',ojProblem,admin.token);
+ const hidden=await request('oj/problems','POST',{...ojProblem,code:'SECRET',published:false},admin.token);
+ for(const [problem,status,score] of [[1,'AC',100],[1,'AC',100],[p.data.problem.id,'WA',100],[hidden.data.problem.id,'AC',100]]){
+  sqlite.prepare('INSERT INTO oj_submissions(id,user_id,problem_id,problem_code,problem_title,source,revision,status,score,total,judge_url,time_limit,memory_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,1000,256,?,?)').run(randomUUID(),alice.user.id,problem,'saved-code','saved-title','PRIVATE_SOURCE',1,status,score,'https://judge.example','2026-01-01','2026-01-01');
+ }
+ for(const status of ['draft','published'])await request('posts','POST',{...input,status},alice.token);
+ await request('tasks','POST',{title:'PRIVATE_TASK'},alice.token);
+ const response=await request('profiles/'+alice.user.id);
+ assert.equal(response.status,200);
+ assert.equal(response.data.user.display_name,'Alice');
+ assert.equal(response.data.posts.length,1);
+ assert.equal(response.data.solved.length,1);
+ assert.equal(response.data.solved[0].code,'A1000');
+ assert.doesNotMatch(JSON.stringify(response.data),/PRIVATE|password|token|SECRET|source|judge_url/);
+ assert.equal((await request('profiles/9999')).status,404);
+ sqlite.prepare('UPDATE users SET disabled=1 WHERE id=?').run(alice.user.id);
+ assert.equal((await request('profiles/'+alice.user.id)).status,404);
+});
+test('Large files upload privately, preserve bytes, preview in bounds and attach by immutable IDs',async(t)=>{
+ const {request,register,owner,env,objects,sqlite}=setup(t);
+ const alice=await register('Alice'),admin=await owner();
+ const data='1 2\n'+'0 '.repeat(400000)+'\n';
+ assert.equal((await request('oj/files?name=1.in','POST',new Blob([data]))).status,401);
+ assert.equal((await request('oj/files?name=1.in','POST',new Blob([data]),alice.token)).status,403);
+ const uploaded=await request('oj/files?name=1.in','POST',new Blob([data]),admin.token);
+ assert.equal(uploaded.status,201);
+ const id=uploaded.data.file.id;
+ assert.equal(uploaded.data.file.size,Buffer.byteLength(data));
+ assert.equal(objects.size,1);
+ assert.equal((await request('oj/files/'+id+'/preview','GET',undefined,admin.token)).data.content,data.slice(0,4096));
+ assert.equal((await request('oj/files/'+id+'/preview','GET',undefined,admin.token)).data.truncated,true);
+ const download=await request('oj/files/'+id,'GET',undefined,admin.token);
+ assert.equal(download.data,data);
+ assert.equal(download.headers.get('Access-Control-Allow-Origin'),'https://heruoqwq.github.io');
+ assert.equal((await request('oj/files/'+id,'GET',undefined,alice.token)).status,403);
+ const problem={...ojProblem,cases:[{input:'',output:'3\n',input_file:id,weight:1}]};
+ const made=await request('oj/problems','POST',problem,admin.token);
+ assert.equal(made.status,201);
+ const editable=(await request('oj/problems/'+made.data.problem.id+'?edit=1','GET',undefined,admin.token)).data.problem;
+ assert.equal(editable.cases[0].input,'');
+ assert.equal(editable.cases[0].input_file,id);
+ assert.equal(editable.cases[0].input_name,'1.in');
+ assert.equal(editable.cases[0].input_size,Buffer.byteLength(data));
+ assert.doesNotMatch(JSON.stringify((await request('oj/problems/'+made.data.problem.id)).data),/input_file|input_name|input_size|cases/);
+ assert.equal((await request('oj/files?name=bad.in','POST',new Blob([new Uint8Array([255,254])]),admin.token)).status,400);
+ const tooBig=await handleApi(new Request('https://blog.example/api/oj/files?name=big.in',{method:'POST',headers:{Authorization:'Bearer '+admin.token,'Content-Length':String(16*1024*1024+1)},body:'x'}),env);
+ assert.equal(tooBig.status,413);
+ const absent={...problem,code:'MISSING',cases:[{input:'',output:'',weight:1,input_file:randomUUID()}]};
+ assert.equal((await request('oj/problems','POST',absent,admin.token)).status,400);
+ sqlite.prepare('UPDATE oj_files SET size=? WHERE id=?').run(16*1024*1024,id);
+ assert.equal((await request('oj/problems','POST',{...problem,code:'OVER'},admin.token)).status,400);
+});
+test('Fifty tests dispatch and collect in batches of at most twenty, preserving numeric order and scores',async(t)=>{
+ const {request,register,owner}=setup(t);
+ const original=globalThis.fetch, calls=[];
+ let count=0;
+ globalThis.fetch=async(url,options={})=>{
+  calls.push({url,options});
+  if(options.method==='POST')return Response.json(JSON.parse(options.body).submissions.map(()=>({token:(++count).toString().padStart(8,'0')+'-0000-4000-8000-000000000000'})));
+  return Response.json({submissions:new URL(url).searchParams.get('tokens').split(',').reverse().map(token=>({token,status:{id:3},time:'0.001',memory:1024}))});
+ };
+ t.after(()=>{globalThis.fetch=original;});
+ const admin=await owner(),alice=await register('Alice');
+ const made=await request('oj/problems','POST',{...ojProblem,cases:Array.from({length:50},(_,i)=>({input:i+'\n',output:i+'\n',weight:i+1}))},admin.token);
+ assert.equal(made.status,201);
+ const submitted=await request('oj/submissions','POST',{problem_id:made.data.problem.id,language:'cpp17',source:'int main(){}'},alice.token);
+ assert.equal(submitted.data.submission.status,'JUDGING');
+ assert.deepEqual(calls.filter(c=>c.options.method==='POST').map(c=>JSON.parse(c.options.body).submissions.length),[20,20,10]);
+ const result=(await request('oj/submissions/'+submitted.data.submission.id,'GET',undefined,alice.token)).data.submission;
+ assert.equal(result.status,'AC');assert.equal(result.score,100);assert.equal(result.passed,50);
+ assert.deepEqual(result.details.map(d=>d.index),Array.from({length:50},(_,i)=>i+1));
+ assert.equal((await request('oj/problems','POST',{...ojProblem,code:'TOOMANY',cases:Array.from({length:51},()=>({input:'',output:'',weight:1}))},admin.token)).status,400);
+});
+test('Point diagnostics require ownership; only superadmin sees output logs and no endpoint exposes judge tokens',async(t)=>{
+ const {request,register,owner}=setup(t);
+ const alice=await register('Alice'),bobby=await register('Bobby'),admin=await owner();
+ judgeMock(t,[3,4]);
+ const made=await request('oj/problems','POST',ojProblem,admin.token);
+ const submitted=await request('oj/submissions','POST',{problem_id:made.data.problem.id,language:'cpp17',source:'int main(){}'},alice.token);
+ const id=submitted.data.submission.id;
+ await request('oj/submissions/'+id,'GET',undefined,alice.token);
+ globalThis.fetch=async()=>Response.json({stdout:Buffer.from('SECRET_INPUT_ECHO'.repeat(1000)).toString('base64'),stderr:Buffer.from('SECRET_ERROR').toString('base64'),message:Buffer.from('Runtime stopped').toString('base64'),exit_code:1,exit_signal:11});
+ assert.equal((await request('oj/submissions/'+id+'/cases/1')).status,401);
+ assert.equal((await request('oj/submissions/'+id+'/cases/1','GET',undefined,bobby.token)).status,404);
+ const own=await request('oj/submissions/'+id+'/cases/1','GET',undefined,alice.token);
+ assert.equal(own.data.stdout,'');assert.equal(own.data.stderr,'');assert.equal(own.data.exit_code,1);
+ assert.doesNotMatch(JSON.stringify(own.data),/SECRET|token|judge_url|HIDDEN/);
+ const diagnostic=await request('oj/submissions/'+id+'/cases/1','GET',undefined,admin.token);
+ assert.equal(diagnostic.data.stdout.length,4000);
+ assert.equal(diagnostic.data.stderr,'SECRET_ERROR');
+ assert.equal(diagnostic.data.truncated,true);
+ assert.doesNotMatch(JSON.stringify(diagnostic.data),/token|judge_url|HIDDEN/);
+ assert.equal((await request('oj/submissions/'+id+'/cases/3','GET',undefined,admin.token)).status,404);
 });

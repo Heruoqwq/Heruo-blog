@@ -13,7 +13,7 @@ test('Worker runtime can dispatch and collect Judge0 jobs with safe manual redir
  const requests=[];
  let redirectReply=false;
  const token='00000001-0000-4000-8000-000000000000';
- const mf=new Miniflare({modules:true,script:compiled+'\nexport default {fetch:handleApi};',compatibilityDate:'2026-05-15',d1Databases:['DB'],bindings:{ADMIN_PASSWORD_HASH:hash},outboundService:async(request)=>{
+ const mf=new Miniflare({modules:true,script:compiled+'\nexport default {fetch:handleApi};',compatibilityDate:'2026-05-15',d1Databases:['DB'],r2Buckets:['BUCKET'],bindings:{ADMIN_PASSWORD_HASH:hash},outboundService:async(request)=>{
   requests.push({method:request.method,url:request.url});
   if(redirectReply)return new Response(null,{status:302,headers:{Location:'https://unexpected.example/'}});
   if(request.method==='POST'){
@@ -43,6 +43,22 @@ test('Worker runtime can dispatch and collect Judge0 jobs with safe manual redir
  const result=await (await mf.dispatchFetch('https://worker.example/api/oj/submissions/'+created.submission.id,{headers:{Authorization:'Bearer '+auth.token}})).json();
  assert.equal(result.submission.status,'AC');
  assert.equal(result.submission.score,100);
+ const large='1 2\n'+' '.repeat(16*1024*1024-4);
+ const stored=await mf.dispatchFetch('https://worker.example/api/oj/files?name=large.in',{method:'POST',headers:{Authorization:'Bearer '+auth.token,'Content-Type':'application/octet-stream'},body:large});
+ assert.equal(stored.status,201,await stored.clone().text());
+ const uploaded=await stored.json();
+ assert.equal(uploaded.file.size,16*1024*1024);
+ const downloaded=await mf.dispatchFetch('https://worker.example/api/oj/files/'+uploaded.file.id,{headers:{Authorization:'Bearer '+auth.token}});
+ assert.equal((await downloaded.text()).length,16*1024*1024);
+ const made=await mf.dispatchFetch('https://worker.example/api/oj/problems',{method:'POST',headers:{Authorization:'Bearer '+auth.token,'Content-Type':'application/json'},body:JSON.stringify({code:'LARGE',title:'Large',statement:'Large input.',samples:[],time_limit:1000,memory_limit:256,published:false,cases:[{input:'',output:'',input_file:uploaded.file.id,weight:1}]})});
+ assert.equal(made.status,201,await made.clone().text());
+ const problem=await made.json();
+ const largeSubmit=await mf.dispatchFetch('https://worker.example/api/oj/submissions',{method:'POST',headers:{Authorization:'Bearer '+auth.token,'Content-Type':'application/json'},body:JSON.stringify({problem_id:problem.problem.id,language:'cpp17',source:'int main(){}'})});
+ assert.equal(largeSubmit.status,201);
+ const largeResult=await largeSubmit.json();
+ assert.equal(largeResult.submission.status,'JUDGING',largeResult.submission.judge_error);
+ const completed=await(await mf.dispatchFetch('https://worker.example/api/oj/submissions/'+largeResult.submission.id,{headers:{Authorization:'Bearer '+auth.token}})).json();
+ assert.equal(completed.submission.status,'AC');
  redirectReply=true;
  const redirected=await (await mf.dispatchFetch('https://worker.example/api/oj/submissions',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+auth.token},body:JSON.stringify({problem_id:1,language:'cpp17',source:'int main(){}'})})).json();
  assert.equal(redirected.submission.status,'JE');
