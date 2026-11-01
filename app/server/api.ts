@@ -259,14 +259,14 @@ export async function handleApi(request: Request, env: Bindings): Promise<Respon
     return reply({ error: "服务暂时不可用，请稍后重试" }, 500);
   }
 }
-type OjProblem = { id: number; code: string; title: string; statement: string; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
+type OjProblem = { checker: string; scoring: string; id: number; code: string; title: string; statement: string; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
 type OjFile = { id: string; user_id: number; name: string; size: number };
-type OjCase = { input: string; output: string; weight: number; position: number; input_file?: string | null; output_file?: string | null; input_size?: number; output_size?: number; input_name?: string | null; output_name?: string | null };
+type OjCase = { group?: number; input: string; output: string; weight: number; position: number; input_file?: string | null; output_file?: string | null; input_size?: number; output_size?: number; input_name?: string | null; output_name?: string | null };
 const MAX_FILE = 16 * 1024 * 1024;
 const MAX_DATA = 256 * 1024 * 1024;
-const caseSelect = "SELECT c.input,c.output,c.weight,c.position,c.input_file,c.output_file,i.name AS input_name,o.name AS output_name,COALESCE(i.size,length(CAST(c.input AS BLOB))) AS input_size,COALESCE(o.size,length(CAST(c.output AS BLOB))) AS output_size FROM oj_cases c LEFT JOIN oj_files i ON i.id=c.input_file LEFT JOIN oj_files o ON o.id=c.output_file";
-type OjDetail = { index: number; weight: number; status: string; time: number; memory: number };
-type OjSubmission = { id: string; user_id: number; problem_id: number; problem_code: string; problem_title: string; source: string; revision: number; status: string; score: number; passed: number; total: number; time: number; memory: number; details: string; compile_log: string; judge_tokens: string; judge_error: string; judge_attempts: number; judge_started_at: number; judge_url: string; time_limit: number; memory_limit: number; lease_until: number; created_at: string; updated_at: string };
+const caseSelect = "SELECT c.input,c.output,c.weight,c.position,c.group_id AS [group],c.input_file,c.output_file,i.name AS input_name,o.name AS output_name,COALESCE(i.size,length(CAST(c.input AS BLOB))) AS input_size,COALESCE(o.size,length(CAST(c.output AS BLOB))) AS output_size FROM oj_cases c LEFT JOIN oj_files i ON i.id=c.input_file LEFT JOIN oj_files o ON o.id=c.output_file";
+type OjDetail = { group?: number; index: number; weight: number; status: string; time: number; memory: number };
+type OjSubmission = { checker: string; scoring: string; expected_outputs: string; id: string; user_id: number; problem_id: number; problem_code: string; problem_title: string; source: string; revision: number; status: string; score: number; passed: number; total: number; time: number; memory: number; details: string; compile_log: string; judge_tokens: string; judge_error: string; judge_attempts: number; judge_started_at: number; judge_url: string; time_limit: number; memory_limit: number; lease_until: number; created_at: string; updated_at: string };
 const ojSeeds = new WeakMap<D1Database, Promise<void>>();
 const waitingJudge = (s: string) => s === "QUEUED" || s === "JUDGING";
 function integer(value: unknown, label: string, lo: number, hi: number) {
@@ -278,6 +278,8 @@ function plainText(value: unknown, label: string, max: number) {
   return value;
 }
 async function ojInput(value: Record<string, unknown>, db: D1Database) {
+  const checker = value.checker ?? "text", scoring = value.scoring ?? "weighted";
+  if (!["text", "casefold"].includes(String(checker)) || !["weighted", "all", "groups"].includes(String(scoring))) throw new ApiError(400, "评测规则不正确");
   const code = field(value.code, "题号", 24).toUpperCase();
   if (!/^[A-Z0-9][A-Z0-9_-]{0,23}$/.test(code)) throw new ApiError(400, "题号只能包含字母、数字、下划线和连字符");
   const title = field(value.title, "题目名称", 100);
@@ -295,7 +297,7 @@ async function ojInput(value: Record<string, unknown>, db: D1Database) {
     if (!s || typeof s !== "object") throw new ApiError(400, "测试点格式不正确");
     const ref = (v: unknown) => { if (v == null || v === "") return null; if (typeof v !== "string" || !/^[a-f0-9-]{36}$/.test(v)) throw new ApiError(400, "测试文件编号不正确"); return v; };
     const input_file = ref(s.input_file), output_file = ref(s.output_file);
-    return { input: input_file ? "" : plainText(s.input, "测试输入", 400000), output: output_file ? "" : plainText(s.output, "测试输出", 400000), input_file, output_file, weight: integer(s.weight ?? 1, "权重", 1, 100), position: i + 1 };
+    return { input: input_file ? "" : plainText(s.input, "测试输入", 400000), output: output_file ? "" : plainText(s.output, "测试输出", 400000), input_file, output_file, group: integer(s.group ?? 1, "子任务编号", 1, 50), weight: integer(s.weight ?? 1, "权重", 1, 100), position: i + 1 };
   });
   if (encoder.encode(JSON.stringify(cases)).byteLength > 500000) throw new ApiError(400, "文本数据过大，请使用文件上传");
   const refs = [...new Set(cases.flatMap((c) => [c.input_file, c.output_file]).filter((v): v is string => Boolean(v)))];
@@ -303,17 +305,24 @@ async function ojInput(value: Record<string, unknown>, db: D1Database) {
   const sizes = new Map(files.map((f) => [f.id, f.size]));
   if (files.length !== refs.length) throw new ApiError(400, "测试文件不存在，请重新上传");
   let total = 0;
+  const groups = new Map<number, number>();
   for (const c of cases) {
+    if (scoring === "groups") {
+      const previous = groups.get(c.group!);
+      if (previous !== undefined && previous !== c.weight) throw new ApiError(400, "同一子任务的分值必须一致");
+      groups.set(c.group!, c.weight);
+    }
+    if (checker === "casefold" && (c.output_file ? sizes.get(c.output_file)! : encoder.encode(c.output).byteLength) > 4000) throw new ApiError(400, "忽略大小写模式下每点预期输出不能超过 4000 字节");
     const size = (c.input_file ? sizes.get(c.input_file)! : encoder.encode(c.input).byteLength) + (c.output_file ? sizes.get(c.output_file)! : encoder.encode(c.output).byteLength);
     if (size > MAX_FILE) throw new ApiError(400, "每点输入与输出合计不能超过 16 MiB");
     total += size;
   }
   if (total > MAX_DATA) throw new ApiError(400, "测试数据合计不能超过 256 MiB");
-  return { code, title, statement, time_limit, memory_limit, published: value.published ? 1 : 0, samples: JSON.stringify(samples), cases };
+  return { code, title, statement, time_limit, memory_limit, checker: String(checker), scoring: String(scoring), published: value.published ? 1 : 0, samples: JSON.stringify(samples), cases };
 }
 const publicProblem = (p: OjProblem) => ({ ...p, samples: JSON.parse(p.samples), published: Boolean(p.published) });
 function publicSubmission(s: OjSubmission, owner: boolean) {
-  return { id: s.id, user_id: s.user_id, problem_id: s.problem_id, problem_code: s.problem_code, problem_title: s.problem_title, revision: s.revision, language: "C++17", status: s.status, score: s.score, passed: s.passed, total: s.total, time: s.time, memory: s.memory, created_at: s.created_at, updated_at: s.updated_at, ...(owner ? { source: s.source, time_limit: s.time_limit, memory_limit: s.memory_limit, details: JSON.parse(s.details), compile_log: s.compile_log, judge_error: s.judge_error } : {}) };
+  return { id: s.id, user_id: s.user_id, problem_id: s.problem_id, problem_code: s.problem_code, problem_title: s.problem_title, revision: s.revision, language: "C++17", checker: s.checker, scoring: s.scoring, status: s.status, score: s.score, passed: s.passed, total: s.total, time: s.time, memory: s.memory, created_at: s.created_at, updated_at: s.updated_at, ...(owner ? { source: s.source, time_limit: s.time_limit, memory_limit: s.memory_limit, details: JSON.parse(s.details), compile_log: s.compile_log, judge_error: s.judge_error } : {}) };
 }
 async function ensureOj(db: D1Database) {
   let ready = ojSeeds.get(db);
@@ -410,7 +419,7 @@ async function judgeRequest(env: Bindings, base: string, route: string, method =
   if (text.length > limit) throw new JudgeServiceError("评测服务返回内容过长");
   try { return JSON.parse(text); } catch { throw new JudgeServiceError("评测服务返回格式不正确"); }
 }
-export function judgeSummary(results: any[], previous: OjDetail[], tokens: string[], timeLimit: number, memoryLimit: number) {
+export function judgeSummary(results: any[], previous: OjDetail[], tokens: string[], timeLimit: number, memoryLimit: number, scoring = "weighted", expected?: string[]) {
   const map = new Map<string, any>(results.filter((r) => r && typeof r.token === "string").map((r) => [r.token, r]));
   let log = "";
   const details = previous.map((old, i) => {
@@ -420,6 +429,10 @@ export function judgeSummary(results: any[], previous: OjDetail[], tokens: strin
     const time = Number.isFinite(Number(r.time)) ? Math.max(0, Math.ceil(Number(r.time) * 1000)) : 0;
     const memory = Number.isFinite(Number(r.memory)) ? Math.max(0, Math.ceil(Number(r.memory))) : 0;
     let status = id <= 2 ? "JUDGING" : id === 3 ? "AC" : id === 4 ? "WA" : id === 5 ? "TLE" : id === 6 ? "CE" : id >= 7 && id <= 12 ? "RE" : "JE";
+    if (status === "WA" && expected && typeof expected[i] === "string" && typeof r.stdout === "string") {
+      const normalize = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase();
+      if (r.stdout.length <= 50000 && normalize(compileText(r.stdout)) === normalize(expected[i])) status = "AC";
+    }
     if (status === "AC" && time > timeLimit) status = "TLE";
     if (["AC", "RE"].includes(status) && (memory > memoryLimit * 1024 || /memory limit|out of memory|cg-oom/i.test(String(r.message || "")))) status = "MLE";
     if (id === 6 && !log) log = compileText(r.compile_output);
@@ -429,7 +442,18 @@ export function judgeSummary(results: any[], previous: OjDetail[], tokens: strin
   const status = pending ? "JUDGING" : details.some((d) => d.status === "CE") ? "CE" : details.some((d) => d.status === "JE") ? "JE" : details.find((d) => d.status !== "AC")?.status || "AC";
   const passed = details.filter((d) => d.status === "AC").length;
   const weight = details.reduce((a, d) => a + d.weight, 0);
-  const score = status === "CE" || status === "JE" ? 0 : Math.floor(100 * details.filter((d) => d.status === "AC").reduce((a, d) => a + d.weight, 0) / Math.max(1, weight));
+  let score = status === "CE" || status === "JE" ? 0 : Math.floor(100 * details.filter((d) => d.status === "AC").reduce((a, d) => a + d.weight, 0) / Math.max(1, weight));
+  if (scoring === "all") score = status === "AC" ? 100 : 0;
+  if (scoring === "groups") {
+    const groups = new Map<number, { weight: number; accepted: boolean }>();
+    for (const d of details) {
+      const old = groups.get(d.group || 1);
+      groups.set(d.group || 1, { weight: d.weight, accepted: (!old || old.accepted) && d.status === "AC" });
+    }
+    const total = [...groups.values()].reduce((sum, group) => sum + group.weight, 0);
+    const accepted = [...groups.values()].filter((group) => group.accepted).reduce((sum, group) => sum + group.weight, 0);
+    score = status === "CE" || status === "JE" ? 0 : Math.floor(100 * accepted / Math.max(1, total));
+  }
   return { details, status, passed, score, time: Math.max(0, ...details.map((d) => d.time)), memory: Math.max(0, ...details.map((d) => d.memory)), compile_log: log };
 }
 async function refreshJudge(db: D1Database, env: Bindings, submission: OjSubmission) {
@@ -448,11 +472,11 @@ async function refreshJudge(db: D1Database, env: Bindings, submission: OjSubmiss
   try {
     const results: any[] = [];
     for (let i = 0; i < tokens.length; i += 20) {
-      const result = await judgeRequest(env, submission.judge_url, "/submissions/batch?base64_encoded=true&tokens=" + tokens.slice(i, i + 20).join(",") + "&fields=token,status,time,memory,compile_output,message");
+      const result = await judgeRequest(env, submission.judge_url, "/submissions/batch?base64_encoded=true&tokens=" + tokens.slice(i, i + 20).join(",") + "&fields=token,status,time,memory,compile_output,message" + (submission.checker === "casefold" ? ",stdout" : ""));
       if (!Array.isArray(result.submissions)) throw new JudgeServiceError("评测服务返回结果格式不正确");
       results.push(...result.submissions);
     }
-    const summary = judgeSummary(results, JSON.parse(submission.details), tokens, submission.time_limit, submission.memory_limit);
+    const summary = judgeSummary(results, JSON.parse(submission.details), tokens, submission.time_limit, submission.memory_limit, submission.scoring, submission.checker === "casefold" ? JSON.parse(submission.expected_outputs) : undefined);
     const stamp = new Date().toISOString();
     await db.prepare("UPDATE oj_submissions SET status=?,score=?,passed=?,time=?,memory=?,details=?,compile_log=?,lease_until=?,judge_error='',updated_at=? WHERE id=? AND lease_until=?").bind(summary.status, summary.score, summary.passed, summary.time, summary.memory, JSON.stringify(summary.details), summary.compile_log, now + 2500, stamp, submission.id, now + 22000).run();
     return { ...submission, ...summary, details: JSON.stringify(summary.details), updated_at: stamp };
@@ -524,9 +548,9 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
     requireSuper();
     const p = await ojInput(await body(request), db);
     if (await db.prepare("SELECT id FROM oj_problems WHERE code=?").bind(p.code).first()) throw new ApiError(409, "题号已存在");
-    const row = await db.prepare("INSERT INTO oj_problems(code,title,statement,samples,time_limit,memory_limit,published,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?) RETURNING *").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, stamp, stamp).first<OjProblem>();
+    const row = await db.prepare("INSERT INTO oj_problems(code,title,statement,samples,time_limit,memory_limit,published,created_at,updated_at,checker,scoring) VALUES(?,?,?,?,?,?,0,?,?,?,?) RETURNING *").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, stamp, stamp, p.checker, p.scoring).first<OjProblem>();
     if (!row) throw new ApiError(500, "题目保存失败");
-    await db.batch([...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file) VALUES(?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), row.id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null)), db.prepare("UPDATE oj_problems SET published=? WHERE id=?").bind(p.published, row.id)]);
+    await db.batch([...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), row.id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1)), db.prepare("UPDATE oj_problems SET published=? WHERE id=?").bind(p.published, row.id)]);
     return reply({ problem: publicProblem({ ...row, published: p.published }) }, 201);
   }
   const pm = path.match(/^problems\/([1-9]\d{0,8})$/);
@@ -547,7 +571,7 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
       const p = await ojInput(await body(request), db);
       const other = await db.prepare("SELECT id FROM oj_problems WHERE code=? AND id<>?").bind(p.code, id).first();
       if (other) throw new ApiError(409, "题号已存在");
-      await db.batch([db.prepare("UPDATE oj_problems SET code=?,title=?,statement=?,samples=?,time_limit=?,memory_limit=?,published=?,revision=revision+1,updated_at=? WHERE id=?").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, p.published, stamp, id), db.prepare("DELETE FROM oj_cases WHERE problem_id=?").bind(id), ...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file) VALUES(?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null))]);
+      await db.batch([db.prepare("UPDATE oj_problems SET code=?,title=?,statement=?,samples=?,time_limit=?,memory_limit=?,published=?,checker=?,scoring=?,revision=revision+1,updated_at=? WHERE id=?").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, p.published, p.checker, p.scoring, stamp, id), db.prepare("DELETE FROM oj_cases WHERE problem_id=?").bind(id), ...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1))]);
       return reply({ problem: publicProblem({ ...row, ...p, revision: row.revision + 1, updated_at: stamp }) });
     }
   }
@@ -568,8 +592,16 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
     if (current?.revision !== p.revision) throw new ApiError(409, "题目已更新，请重新提交");
     const id = crypto.randomUUID();
     const base = judgeUrl(env);
-    const details: OjDetail[] = tests.map((c, i) => ({ index: i + 1, weight: c.weight, status: "QUEUED", time: 0, memory: 0 }));
-    await db.prepare("INSERT INTO oj_submissions(id,user_id,problem_id,problem_code,problem_title,source,revision,total,details,judge_url,created_at,updated_at,time_limit,memory_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id, u.id, p.id, p.code, p.title, source, p.revision, tests.length, JSON.stringify(details), base, stamp, stamp, p.time_limit, p.memory_limit).run();
+    const details: OjDetail[] = tests.map((c, i) => ({ index: i + 1, group: c.group || 1, weight: c.weight, status: "QUEUED", time: 0, memory: 0 }));
+    const expected: string[] = [];
+    if (p.checker === "casefold") for (const c of tests) {
+      if (c.output_file) {
+        const object = await env.BUCKET?.get("oj/data/" + c.output_file);
+        if (!object || object.size > 4000) throw new ApiError(400, "预期输出文件不存在或过大");
+        expected.push(await object.text());
+      } else expected.push(c.output);
+    }
+    await db.prepare("INSERT INTO oj_submissions(id,user_id,problem_id,problem_code,problem_title,source,revision,total,details,judge_url,created_at,updated_at,time_limit,memory_limit,checker,scoring,expected_outputs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id, u.id, p.id, p.code, p.title, source, p.revision, tests.length, JSON.stringify(details), base, stamp, stamp, p.time_limit, p.memory_limit, p.checker, p.scoring, JSON.stringify(expected)).run();
     const saved = await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(id).first<OjSubmission>();
     const submission = await dispatchJudge(db, env, saved!, tests);
     return reply({ submission: publicSubmission(submission!, true) }, 201);

@@ -229,3 +229,5 @@
 @media(max-width:540px){.profile-page{padding:24px 20px}.profile-heading h1{font-size:23px}.oj-data-row>.oj-case-field{flex-basis:100%}.oj-point>summary{grid-template-columns:30px 1fr 60px 65px 14px;gap:6px;padding:14px 2px;font-size:11px}.oj-point-meta{gap:10px;font-size:11px}.profile-stats{font-size:12px}.feed-tabs{gap:24px}.feed-tabs button{font-size:13px}.solved-list a span{max-width:150px}.manage-row>.feature-button{margin-left:0}}
 
 .oj-editor-fields{border:0;padding:0;margin:0;min-width:0}
+
+.oj-fields select{border:1px solid var(--line);border-radius:5px;padding:10px;background:var(--surface);width:100%}
