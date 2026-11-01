@@ -236,7 +236,7 @@ export async function handleApi(request: Request, env: Bindings): Promise<Respon
 type OjProblem = { id: number; code: string; title: string; statement: string; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
 type OjCase = { input: string; output: string; weight: number; position: number };
 type OjDetail = { index: number; weight: number; status: string; time: number; memory: number };
-type OjSubmission = { id: string; user_id: number; problem_id: number; problem_code: string; problem_title: string; source: string; revision: number; status: string; score: number; passed: number; total: number; time: number; memory: number; details: string; compile_log: string; judge_tokens: string; judge_url: string; time_limit: number; memory_limit: number; lease_until: number; created_at: string; updated_at: string };
+type OjSubmission = { id: string; user_id: number; problem_id: number; problem_code: string; problem_title: string; source: string; revision: number; status: string; score: number; passed: number; total: number; time: number; memory: number; details: string; compile_log: string; judge_tokens: string; judge_error: string; judge_attempts: number; judge_started_at: number; judge_url: string; time_limit: number; memory_limit: number; lease_until: number; created_at: string; updated_at: string };
 const ojSeeds = new WeakMap<D1Database, Promise<void>>();
 const waitingJudge = (s: string) => s === "QUEUED" || s === "JUDGING";
 function integer(value: unknown, label: string, lo: number, hi: number) {
@@ -270,7 +270,7 @@ function ojInput(value: Record<string, unknown>) {
 }
 const publicProblem = (p: OjProblem) => ({ ...p, samples: JSON.parse(p.samples), published: Boolean(p.published) });
 function publicSubmission(s: OjSubmission, owner: boolean) {
-  return { id: s.id, user_id: s.user_id, problem_id: s.problem_id, problem_code: s.problem_code, problem_title: s.problem_title, revision: s.revision, language: "C++17", status: s.status, score: s.score, passed: s.passed, total: s.total, time: s.time, memory: s.memory, created_at: s.created_at, updated_at: s.updated_at, ...(owner ? { source: s.source, details: JSON.parse(s.details), compile_log: s.compile_log } : {}) };
+  return { id: s.id, user_id: s.user_id, problem_id: s.problem_id, problem_code: s.problem_code, problem_title: s.problem_title, revision: s.revision, language: "C++17", status: s.status, score: s.score, passed: s.passed, total: s.total, time: s.time, memory: s.memory, created_at: s.created_at, updated_at: s.updated_at, ...(owner ? { source: s.source, details: JSON.parse(s.details), compile_log: s.compile_log, judge_error: s.judge_error } : {}) };
 }
 async function ensureOj(db: D1Database) {
   let ready = ojSeeds.get(db);
@@ -302,12 +302,48 @@ function compileText(value: unknown) {
   if (typeof value !== "string" || value.length > 50000) return "";
   try { return new TextDecoder().decode(Uint8Array.from(atob(value), (c) => c.charCodeAt(0))).slice(0, 8000); } catch { return ""; }
 }
+class JudgeServiceError extends Error {}
+function judgeFailure(error: unknown) {
+  if (error instanceof JudgeServiceError) return error.message;
+  if (error instanceof Error && /timeout|timed out|abort/i.test(error.name + " " + error.message)) return "连接评测服务超时";
+  return "无法连接评测服务";
+}
+async function dispatchJudge(db: D1Database, env: Bindings, submission: OjSubmission, tests: OjCase[]) {
+  const now = Date.now();
+  const details: OjDetail[] = JSON.parse(submission.details).map((d: OjDetail) => ({ ...d, status: "QUEUED", time: 0, memory: 0 }));
+  const claimed = await db.prepare("UPDATE oj_submissions SET status='QUEUED',judge_tokens='[]',details=?,score=0,passed=0,time=0,memory=0,compile_log='',judge_error='',judge_started_at=?,judge_attempts=judge_attempts+1,lease_until=? WHERE id=? AND judge_attempts=? AND status IN ('QUEUED','JE') RETURNING *").bind(JSON.stringify(details), now, now + 22000, submission.id, submission.judge_attempts).first<OjSubmission>();
+  if (!claimed) return (await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(submission.id).first<OjSubmission>()) || submission;
+  try {
+    const language = Number(env.JUDGE0_LANGUAGE_ID || 105);
+    if (!Number.isInteger(language) || language < 1) throw new JudgeServiceError("评测语言配置不正确");
+    const result = await judgeRequest(env, submission.judge_url, "/submissions/batch?base64_encoded=true", "POST", { submissions: tests.map((c) => ({ source_code: base64(submission.source), language_id: language, stdin: base64(c.input), expected_output: base64(c.output), cpu_time_limit: submission.time_limit / 1000, cpu_extra_time: 0.5, wall_time_limit: Math.min(30, submission.time_limit / 1000 * 2 + 2), memory_limit: submission.memory_limit * 1024, stack_limit: Math.min(128000, submission.memory_limit * 1024), compiler_options: "-std=c++17 -O2", max_file_size: 1024, number_of_runs: 1, enable_network: false })) });
+    if (!Array.isArray(result) || result.length !== tests.length || result.some((r) => !/^[a-f0-9-]{36}$/.test(r?.token || ""))) throw new JudgeServiceError("评测服务未返回有效任务编号");
+    await db.prepare("UPDATE oj_submissions SET judge_tokens=?,status='JUDGING',details=?,score=0,passed=0,time=0,memory=0,compile_log='',judge_error='',lease_until=0,updated_at=? WHERE id=? AND judge_attempts=? AND status='QUEUED'").bind(JSON.stringify(result.map((r) => r.token)), JSON.stringify(details), new Date().toISOString(), submission.id, claimed.judge_attempts).run();
+  } catch (error) {
+    const message = judgeFailure(error);
+    console.error("OJ dispatch failed", JSON.stringify({ submission_id: submission.id, attempt: claimed.judge_attempts, reason: message }));
+    await db.prepare("UPDATE oj_submissions SET status='JE',details=?,judge_error=?,lease_until=0,updated_at=? WHERE id=? AND judge_attempts=? AND status='QUEUED'").bind(JSON.stringify(details.map((d) => ({ ...d, status: "JE" }))), message, new Date().toISOString(), submission.id, claimed.judge_attempts).run();
+  }
+  return (await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(submission.id).first<OjSubmission>()) || claimed;
+}
+async function retryJudge(db: D1Database, env: Bindings, submission: OjSubmission) {
+  const p = await db.prepare("SELECT revision FROM oj_problems WHERE id=?").bind(submission.problem_id).first<{ revision: number }>();
+  if (!p || p.revision !== submission.revision) {
+    await db.prepare("UPDATE oj_submissions SET judge_attempts=judge_attempts+1,judge_error=? WHERE id=? AND judge_attempts=? AND status='JE'").bind("题目已更新，请按新版本重新提交", submission.id, submission.judge_attempts).run();
+    return { ...submission, judge_attempts: submission.judge_attempts + 1, judge_error: "题目已更新，请按新版本重新提交" };
+  }
+  const tests = (await db.prepare("SELECT input,output,weight,position FROM oj_cases WHERE problem_id=? ORDER BY position").bind(submission.problem_id).all<OjCase>()).results;
+  const previous: OjDetail[] = JSON.parse(submission.details);
+  const current = await db.prepare("SELECT revision FROM oj_problems WHERE id=?").bind(submission.problem_id).first<{ revision: number }>();
+  if (current?.revision !== submission.revision || tests.length !== submission.total || tests.some((c, i) => c.weight !== previous[i]?.weight)) throw new ApiError(409, "题目已更新，请重新提交");
+  return dispatchJudge(db, env, submission, tests);
+}
 async function judgeRequest(env: Bindings, base: string, route: string, method = "GET", data?: unknown): Promise<any> {
-  const response = await fetch(base + route, { method, redirect: "error", signal: AbortSignal.timeout(18000), headers: { "Content-Type": "application/json", ...(env.JUDGE0_TOKEN && base === judgeUrl(env) ? { "X-Auth-Token": env.JUDGE0_TOKEN } : {}) }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
-  if (!response.ok) throw new Error("Judge service HTTP " + response.status);
+  const response = await fetch(base + route, { method, redirect: "manual", signal: AbortSignal.timeout(18000), headers: { "Content-Type": "application/json", ...(env.JUDGE0_TOKEN && base === judgeUrl(env) ? { "X-Auth-Token": env.JUDGE0_TOKEN } : {}) }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
+  if (!response.ok) throw new JudgeServiceError("评测服务请求失败（HTTP " + response.status + "）");
   const text = await response.text();
-  if (text.length > 2000000) throw new Error("Judge service response too large");
-  return JSON.parse(text);
+  if (text.length > 2000000) throw new JudgeServiceError("评测服务返回内容过长");
+  try { return JSON.parse(text); } catch { throw new JudgeServiceError("评测服务返回格式不正确"); }
 }
 export function judgeSummary(results: any[], previous: OjDetail[], tokens: string[], timeLimit: number, memoryLimit: number) {
   const map = new Map<string, any>(results.filter((r) => r && typeof r.token === "string").map((r) => [r.token, r]));
@@ -332,12 +368,13 @@ export function judgeSummary(results: any[], previous: OjDetail[], tokens: strin
   return { details, status, passed, score, time: Math.max(0, ...details.map((d) => d.time)), memory: Math.max(0, ...details.map((d) => d.memory)), compile_log: log };
 }
 async function refreshJudge(db: D1Database, env: Bindings, submission: OjSubmission) {
+  if (submission.status === "JE" && submission.judge_attempts === 0 && submission.judge_tokens === "[]") submission = await retryJudge(db, env, submission);
   if (!["QUEUED", "JUDGING"].includes(submission.status)) return submission;
   const now = Date.now();
-  if (now - Date.parse(submission.created_at) > 10 * 60 * 1000) {
+  if (now - (submission.judge_started_at || Date.parse(submission.created_at)) > 10 * 60 * 1000) {
     const details = JSON.stringify((JSON.parse(submission.details) as OjDetail[]).map((d) => ({ ...d, status: waitingJudge(d.status) ? "JE" : d.status })));
-    await db.prepare("UPDATE oj_submissions SET status='JE',score=0,details=?,lease_until=0,updated_at=? WHERE id=? AND status IN ('QUEUED','JUDGING')").bind(details, new Date(now).toISOString(), submission.id).run();
-    return { ...submission, status: "JE", score: 0, details };
+    await db.prepare("UPDATE oj_submissions SET status='JE',score=0,details=?,judge_error='评测等待超时，可点击重新评测',lease_until=0,updated_at=? WHERE id=? AND status IN ('QUEUED','JUDGING')").bind(details, new Date(now).toISOString(), submission.id).run();
+    return { ...submission, status: "JE", score: 0, details, judge_error: "评测等待超时，可点击重新评测" };
   }
   const tokens = JSON.parse(submission.judge_tokens) as string[];
   if (!tokens.length) return submission;
@@ -345,14 +382,16 @@ async function refreshJudge(db: D1Database, env: Bindings, submission: OjSubmiss
   if (!lease) return submission;
   try {
     const result = await judgeRequest(env, submission.judge_url, "/submissions/batch?base64_encoded=true&tokens=" + tokens.join(",") + "&fields=token,status,time,memory,compile_output,message");
-    if (!Array.isArray(result.submissions)) throw new Error("Invalid judge response");
+    if (!Array.isArray(result.submissions)) throw new JudgeServiceError("评测服务返回结果格式不正确");
     const summary = judgeSummary(result.submissions, JSON.parse(submission.details), tokens, submission.time_limit, submission.memory_limit);
     const stamp = new Date().toISOString();
-    await db.prepare("UPDATE oj_submissions SET status=?,score=?,passed=?,time=?,memory=?,details=?,compile_log=?,lease_until=?,updated_at=? WHERE id=? AND lease_until=?").bind(summary.status, summary.score, summary.passed, summary.time, summary.memory, JSON.stringify(summary.details), summary.compile_log, now + 2500, stamp, submission.id, now + 22000).run();
+    await db.prepare("UPDATE oj_submissions SET status=?,score=?,passed=?,time=?,memory=?,details=?,compile_log=?,lease_until=?,judge_error='',updated_at=? WHERE id=? AND lease_until=?").bind(summary.status, summary.score, summary.passed, summary.time, summary.memory, JSON.stringify(summary.details), summary.compile_log, now + 2500, stamp, submission.id, now + 22000).run();
     return { ...submission, ...summary, details: JSON.stringify(summary.details), updated_at: stamp };
-  } catch {
-    await db.prepare("UPDATE oj_submissions SET lease_until=? WHERE id=? AND lease_until=?").bind(now + 6000, submission.id, now + 22000).run();
-    return submission;
+  } catch (error) {
+    const message = judgeFailure(error);
+    console.error("OJ result lookup failed", JSON.stringify({ submission_id: submission.id, reason: message }));
+    await db.prepare("UPDATE oj_submissions SET lease_until=?,judge_error=? WHERE id=? AND lease_until=?").bind(now + 6000, message, submission.id, now + 22000).run();
+    return { ...submission, judge_error: message };
   }
 }
 async function handleOj(request: Request, env: Bindings, db: D1Database, user: Account | null, path: string, reply: (data: unknown, status?: number) => Response): Promise<Response> {
@@ -418,16 +457,8 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
     const base = judgeUrl(env);
     const details: OjDetail[] = tests.map((c, i) => ({ index: i + 1, weight: c.weight, status: "QUEUED", time: 0, memory: 0 }));
     await db.prepare("INSERT INTO oj_submissions(id,user_id,problem_id,problem_code,problem_title,source,revision,total,details,judge_url,created_at,updated_at,time_limit,memory_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(id, u.id, p.id, p.code, p.title, source, p.revision, tests.length, JSON.stringify(details), base, stamp, stamp, p.time_limit, p.memory_limit).run();
-    try {
-      const language = Number(env.JUDGE0_LANGUAGE_ID || 105);
-      if (!Number.isInteger(language) || language < 1) throw new Error("Invalid judge language");
-      const result = await judgeRequest(env, base, "/submissions/batch?base64_encoded=true", "POST", { submissions: tests.map((c) => ({ source_code: base64(source), language_id: language, stdin: base64(c.input), expected_output: base64(c.output), cpu_time_limit: p.time_limit / 1000, cpu_extra_time: 0.5, wall_time_limit: Math.min(30, p.time_limit / 1000 * 2 + 2), memory_limit: p.memory_limit * 1024, stack_limit: Math.min(128000, p.memory_limit * 1024), compiler_options: "-std=c++17 -O2", max_file_size: 1024, number_of_runs: 1, enable_network: false })) });
-      if (!Array.isArray(result) || result.length !== tests.length || result.some((r) => !/^[a-f0-9-]{36}$/.test(r?.token || ""))) throw new Error("Invalid judge submission response");
-      await db.prepare("UPDATE oj_submissions SET judge_tokens=?,status='JUDGING',updated_at=? WHERE id=?").bind(JSON.stringify(result.map((r) => r.token)), new Date().toISOString(), id).run();
-    } catch {
-      await db.prepare("UPDATE oj_submissions SET status='JE',details=?,updated_at=? WHERE id=?").bind(JSON.stringify(details.map((d) => ({ ...d, status: "JE" }))), new Date().toISOString(), id).run();
-    }
-    const submission = await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(id).first<OjSubmission>();
+    const saved = await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(id).first<OjSubmission>();
+    const submission = await dispatchJudge(db, env, saved!, tests);
     return reply({ submission: publicSubmission(submission!, true) }, 201);
   }
   if (path === "submissions" && request.method === "GET") {
@@ -440,9 +471,19 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
     if (mine) values.push(user!.id);
     values.push(offset);
     const rows = await q.bind(...values).all<OjSubmission & { username: string }>();
-    const updates = await Promise.all(rows.results.filter((s) => waitingJudge(s.status)).slice(0, 3).map((s) => refreshJudge(db, env, s)));
+    const updates = await Promise.all(rows.results.filter((s) => waitingJudge(s.status) || (s.status === "JE" && s.judge_attempts === 0 && s.judge_tokens === "[]")).slice(0, 3).map((s) => refreshJudge(db, env, s)));
     const latest = new Map(updates.map((s) => [s.id, s]));
     return reply({ submissions: rows.results.map((s) => ({ ...publicSubmission(latest.get(s.id) || s, false), username: s.username })), next_offset: rows.results.length === 30 && offset + 30 <= 10000 ? offset + 30 : null });
+  }
+  const retry = path.match(/^submissions\/([a-f0-9-]{36})\/rejudge$/);
+  if (retry && request.method === "POST") {
+    const u = requireUser();
+    const row = await db.prepare("SELECT * FROM oj_submissions WHERE id=?").bind(retry[1]).first<OjSubmission>();
+    if (!row || (row.user_id !== u.id && !superuser(user))) throw new ApiError(404, "提交不存在");
+    if (row.status !== "JE") throw new ApiError(409, "当前提交无需重评");
+    await rateLimit(db, request, "oj-retry-user-" + u.id, 5, now);
+    const result = await retryJudge(db, env, row);
+    return reply({ submission: publicSubmission(result, true) });
   }
   const sm = path.match(/^submissions\/([a-f0-9-]{36})$/);
   if (sm && request.method === "GET") {

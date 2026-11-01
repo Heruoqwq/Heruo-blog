@@ -245,6 +245,7 @@ test('OJ submits real bounded Judge0 jobs; out-of-order results are scored by te
  assert.equal(outbound.submissions[0].cpu_time_limit,1);
  assert.equal(outbound.submissions[0].memory_limit,262144);
  assert.equal(outbound.submissions[0].language_id,105);
+ assert.equal(mock.calls[0].options.redirect,'manual');
  const result=await request('oj/submissions/'+id,'GET',undefined,a.token);
  assert.equal(result.data.submission.status,'WA');
  assert.equal(result.data.submission.score,75);
@@ -295,7 +296,7 @@ test('OJ never grants AC on judge errors, timeouts, missing results, or unauthen
  assert.ok(made.data.submission.details.every(d=>d.status==='JE'));
  assert.equal(made.data.submission.score,0);
  const id=made.data.submission.id;
- sqlite.prepare("UPDATE oj_submissions SET status='JUDGING',judge_tokens=?,created_at=?,lease_until=0 WHERE id=?").run(JSON.stringify(mock.tokens),new Date(Date.now()-11*60*1000).toISOString(),id);
+ sqlite.prepare("UPDATE oj_submissions SET status='JUDGING',judge_tokens=?,created_at=?,judge_started_at=0,lease_until=0 WHERE id=?").run(JSON.stringify(mock.tokens),new Date(Date.now()-11*60*1000).toISOString(),id);
  assert.equal((await request('oj/submissions/'+id,'GET',undefined,a.token)).data.submission.status,'JE');
 });
 test('Judge verdicts include AC, WA, TLE, MLE, RE, CE and JE; missing tests cannot be accepted',()=>{
@@ -313,4 +314,67 @@ test('Judge verdicts include AC, WA, TLE, MLE, RE, CE and JE; missing tests cann
  assert.equal(result(13).status,'JE');
  assert.equal(judgeSummary([],prev,[token],1000,256).status,'JUDGING');
  assert.equal(judgeSummary([{token:'different',status:{id:3}}],prev,[token],1000,256).status,'JUDGING');
+});
+
+test('Legacy dispatch failures automatically recover once without changing submitted source or ownership',async(t)=>{
+ const {request,register,owner,sqlite}=setup(t);
+ const mock=judgeMock(t,[3,3]);
+ const a=await register('Alice'),admin=await owner();
+ const p=await request('oj/problems','POST',ojProblem,admin.token);
+ const made=await request('oj/submissions','POST',{problem_id:p.data.problem.id,language:'cpp17',source:'int main(){}'},a.token);
+ const id=made.data.submission.id;
+ sqlite.prepare("UPDATE oj_submissions SET status='JE',judge_tokens='[]',judge_attempts=0,judge_started_at=0,lease_until=0,created_at=? WHERE id=?").run(new Date(Date.now()-3600000).toISOString(),id);
+ const before=mock.calls.filter(c=>c.options.method==='POST').length;
+ const first=await request('oj/submissions/'+id,'GET',undefined,a.token);
+ assert.equal(first.data.submission.status,'AC');
+ assert.equal(first.data.submission.user_id,a.user.id);
+ assert.equal(first.data.submission.source,'int main(){}');
+ assert.equal(mock.calls.filter(c=>c.options.method==='POST').length,before+1);
+ assert.equal(sqlite.prepare('SELECT judge_attempts FROM oj_submissions WHERE id=?').get(id).judge_attempts,1);
+ await request('oj/submissions/'+id,'GET',undefined,a.token);
+ assert.equal(mock.calls.filter(c=>c.options.method==='POST').length,before+1);
+});
+test('Judge failures retain a safe reason, never auto-loop, and only author/admin can retry a JE',async(t)=>{
+ const {request,register,owner,sqlite}=setup(t);
+ const mock=judgeMock(t,[3,3]);mock.setFail();
+ const a=await register('Alice'),b=await register('Bobby'),admin=await owner();
+ const p=await request('oj/problems','POST',ojProblem,admin.token);
+ const made=await request('oj/submissions','POST',{problem_id:p.data.problem.id,language:'cpp17',source:'int main(){}'},a.token);
+ const id=made.data.submission.id;
+ assert.equal(made.data.submission.status,'JE');
+ assert.match(made.data.submission.judge_error,/HTTP 503/);
+ const attempts=sqlite.prepare('SELECT judge_attempts FROM oj_submissions WHERE id=?').get(id).judge_attempts;
+ await request('oj/submissions/'+id,'GET',undefined,a.token);
+ assert.equal(sqlite.prepare('SELECT judge_attempts FROM oj_submissions WHERE id=?').get(id).judge_attempts,attempts);
+ assert.equal((await request('oj/submissions/'+id+'/rejudge','POST')).status,401);
+ assert.equal((await request('oj/submissions/'+id+'/rejudge','POST',undefined,b.token)).status,404);
+ assert.equal((await request('oj/submissions/'+id+'/rejudge','POST',undefined,a.token)).status,200);
+ assert.equal(sqlite.prepare('SELECT judge_attempts FROM oj_submissions WHERE id=?').get(id).judge_attempts,attempts+1);
+ await request('oj/problems/'+p.data.problem.id,'PATCH',{...ojProblem,title:'Changed'},admin.token);
+ const changed=await request('oj/submissions/'+id+'/rejudge','POST',undefined,a.token);
+ assert.equal(changed.data.submission.status,'JE');
+ assert.match(changed.data.submission.judge_error,/题目已更新/);
+});
+test('Retry atomically clears old task tokens before dispatch so concurrent readers cannot reuse stale results',async(t)=>{
+ const {request,register,owner,sqlite}=setup(t);
+ const mock=judgeMock(t,[3,3]);
+ const a=await register('Alice'),admin=await owner();
+ const p=await request('oj/problems','POST',ojProblem,admin.token);
+ const made=await request('oj/submissions','POST',{problem_id:p.data.problem.id,language:'cpp17',source:'int main(){}'},a.token);
+ const id=made.data.submission.id;
+ sqlite.prepare("UPDATE oj_submissions SET status='JE',judge_started_at=?,created_at=? WHERE id=?").run(Date.now()-3600000,new Date(Date.now()-3600000).toISOString(),id);
+ const normalFetch=globalThis.fetch;
+ let during;
+ globalThis.fetch=async(url,options={})=>{
+  if(options.method==='POST'){
+   const stored=sqlite.prepare('SELECT status,judge_tokens FROM oj_submissions WHERE id=?').get(id);
+   assert.equal(stored.judge_tokens,'[]');
+   during=(await request('oj/submissions/'+id,'GET',undefined,a.token)).data.submission.status;
+  }
+  return normalFetch(url,options);
+ };
+ const retried=await request('oj/submissions/'+id+'/rejudge','POST',undefined,a.token);
+ assert.equal(during,'QUEUED');
+ assert.equal(retried.data.submission.status,'JUDGING');
+ assert.equal((await request('oj/submissions/'+id,'GET',undefined,a.token)).data.submission.status,'AC');
 });
