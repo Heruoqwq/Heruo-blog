@@ -189,6 +189,34 @@ test('Concurrent same-name registrations have one winner and neither can claim I
 });
 const {judgeSummary}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const ojProblem={code:'TEST1',title:'Secret tests',statement:'A **problem** with $x$.',samples:[{input:'public sample\n',output:'public result\n'}],time_limit:1000,memory_limit:256,published:true,cases:[{input:'HIDDEN_INPUT_ONE\n',output:'HIDDEN_OUTPUT_ONE\n',weight:3},{input:'HIDDEN_INPUT_TWO\n',output:'HIDDEN_OUTPUT_TWO\n',weight:1}]};
+test('OJ editorials keep drafts private and can migrate a legacy note without touching judging data',async(t)=>{
+ const {request,register,owner,sqlite}=setup(t);
+ const admin=await owner(), member=await register('Alice');
+ const editorial='## Proof\n\n```cpp\nint main() {}\n```';
+ const legacy=ojProblem.statement+'\n\n:::info[出题备忘 · 公开前移除]\n\n'+editorial+'\n\n:::';
+ const made=await request('oj/problems','POST',{...ojProblem,statement:legacy},admin.token);
+ assert.equal(made.status,201);
+ const id=made.data.problem.id, route='oj/problems/'+id;
+ const read=async(token)=> (await request(route,'GET',undefined,token)).data.problem;
+ const originalCases=(await request(route+'?edit=1','GET',undefined,admin.token)).data.problem.cases;
+ assert.equal((await read()).statement,ojProblem.statement);
+ assert.equal((await read()).editorial,undefined);
+ assert.equal((await read(admin.token)).editorial,editorial);
+ assert.equal((await read(admin.token)).editorial_published,false);
+ assert.equal((await request(route+'/editorial','PATCH',{editorial,published:true},member.token)).status,403);
+ assert.equal((await request(route+'/editorial','PATCH',{editorial:' ',published:true},admin.token)).status,400);
+ const saved=await request(route+'/editorial','PATCH',{editorial,published:false},admin.token);
+ assert.equal(saved.status,200);
+ assert.equal(saved.data.problem.revision,1);
+ assert.equal(sqlite.prepare('SELECT statement FROM oj_problems WHERE id=?').get(id).statement,ojProblem.statement);
+ assert.deepEqual((await request(route+'?edit=1','GET',undefined,admin.token)).data.problem.cases,originalCases);
+ assert.equal((await read(member.token)).editorial,undefined);
+ assert.equal((await request(route+'/editorial','PATCH',{editorial,published:true},admin.token)).status,200);
+ assert.equal((await read()).editorial,editorial);
+ assert.equal((await request(route,'PATCH',{...ojProblem,published:false},admin.token)).status,200);
+ assert.equal((await request(route)).status,404);
+ assert.equal((await read(admin.token)).editorial,editorial);
+});
 function judgeMock(t,statuses=[3,4]){
  const original=globalThis.fetch;
  const calls=[];

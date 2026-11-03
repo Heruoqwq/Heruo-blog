@@ -259,7 +259,7 @@ export async function handleApi(request: Request, env: Bindings): Promise<Respon
     return reply({ error: "服务暂时不可用，请稍后重试" }, 500);
   }
 }
-type OjProblem = { checker: string; scoring: string; id: number; code: string; title: string; statement: string; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
+type OjProblem = { checker: string; scoring: string; id: number; code: string; title: string; statement: string; editorial: string; editorial_published: number; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
 type OjFile = { id: string; user_id: number; name: string; size: number };
 type OjCase = { group?: number; input: string; output: string; weight: number; position: number; input_file?: string | null; output_file?: string | null; input_size?: number; output_size?: number; input_name?: string | null; output_name?: string | null };
 const MAX_FILE = 16 * 1024 * 1024;
@@ -320,7 +320,23 @@ async function ojInput(value: Record<string, unknown>, db: D1Database) {
   if (total > MAX_DATA) throw new ApiError(400, "测试数据合计不能超过 256 MiB");
   return { code, title, statement, time_limit, memory_limit, checker: String(checker), scoring: String(scoring), published: value.published ? 1 : 0, samples: JSON.stringify(samples), cases };
 }
-const publicProblem = (p: OjProblem) => ({ ...p, samples: JSON.parse(p.samples), published: Boolean(p.published) });
+function splitDraftEditorial(statement: string) {
+  const marker = "\n\n:::info[出题备忘 · 公开前移除]\n";
+  const end = "\n:::";
+  const content = statement.trimEnd();
+  const start = content.lastIndexOf(marker);
+  if (start < 0 || !content.endsWith(end)) return { statement, draft: "" };
+  return { statement: content.slice(0, start).trimEnd(), draft: content.slice(start + marker.length, -end.length).trim() };
+}
+function publicProblem(p: OjProblem, canEdit = false) {
+  const { editorial, editorial_published, ...problem } = p;
+  const { statement, draft } = splitDraftEditorial(problem.statement);
+  const isPublic = Boolean(problem.published && editorial_published && editorial);
+  return {
+    ...problem, statement, samples: JSON.parse(problem.samples), published: Boolean(problem.published),
+    ...(canEdit || isPublic ? { editorial: editorial || draft, editorial_published: Boolean(editorial && editorial_published) } : {}),
+  };
+}
 function publicSubmission(s: OjSubmission, owner: boolean) {
   return { id: s.id, user_id: s.user_id, problem_id: s.problem_id, problem_code: s.problem_code, problem_title: s.problem_title, revision: s.revision, language: "C++17", checker: s.checker, scoring: s.scoring, status: s.status, score: s.score, passed: s.passed, total: s.total, time: s.time, memory: s.memory, created_at: s.created_at, updated_at: s.updated_at, ...(owner ? { source: s.source, time_limit: s.time_limit, memory_limit: s.memory_limit, details: JSON.parse(s.details), compile_log: s.compile_log, judge_error: s.judge_error } : {}) };
 }
@@ -553,19 +569,30 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
     await db.batch([...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), row.id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1)), db.prepare("UPDATE oj_problems SET published=? WHERE id=?").bind(p.published, row.id)]);
     return reply({ problem: publicProblem({ ...row, published: p.published }) }, 201);
   }
-  const pm = path.match(/^problems\/([1-9]\d{0,8})$/);
+  const pm = path.match(/^problems\/([1-9]\d{0,8})(\/editorial)?$/);
   if (pm) {
     const id = Number(pm[1]);
-    const row = await db.prepare("SELECT * FROM oj_problems WHERE id=?").bind(id).first<OjProblem>();
     if (request.method !== "GET") requireSuper();
+    const row = await db.prepare("SELECT * FROM oj_problems WHERE id=?").bind(id).first<OjProblem>();
     if (!row || (!row.published && !superuser(user))) throw new ApiError(404, "题目不存在");
+    if (pm[2]) {
+      if (request.method !== "PATCH") throw new ApiError(404, "接口不存在");
+      const value = await body(request);
+      const editorial = field(value.editorial, "题解", 100000, false);
+      if (typeof value.published !== "boolean" || (value.published && !editorial)) throw new ApiError(400, "公开题解前请填写内容");
+      const { statement } = splitDraftEditorial(row.statement);
+      const saved = await db.prepare("UPDATE oj_problems SET editorial=?,editorial_published=?,statement=?,updated_at=? WHERE id=? AND statement=? RETURNING *")
+        .bind(editorial, Number(value.published), statement, stamp, id, row.statement).first<OjProblem>();
+      if (!saved) throw new ApiError(409, "题面已变更，请刷新后再保存题解");
+      return reply({ problem: publicProblem(saved, true) });
+    }
     if (request.method === "GET") {
       if (url.searchParams.get("edit") === "1") {
         requireSuper();
         const cases = await db.prepare(caseSelect + " WHERE c.problem_id=? ORDER BY c.position").bind(id).all();
-        return reply({ problem: { ...publicProblem(row), cases: cases.results } });
+        return reply({ problem: { ...publicProblem(row), statement: row.statement, cases: cases.results } });
       }
-      return reply({ problem: publicProblem(row) });
+      return reply({ problem: publicProblem(row, superuser(user)) });
     }
     if (request.method === "PATCH") {
       const p = await ojInput(await body(request), db);

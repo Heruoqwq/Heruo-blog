@@ -45,6 +45,8 @@ export const ojProblems = sqliteTable("oj_problems", {
   code: text("code").notNull().unique(),
   title: text("title").notNull(),
   statement: text("statement").notNull(),
+  editorial: text("editorial").notNull().default(""),
+  editorialPublished: integer("editorial_published").notNull().default(0),
   samples: text("samples").notNull().default("[]"),
   timeLimit: integer("time_limit").notNull().default(1000),
   memoryLimit: integer("memory_limit").notNull().default(256),
