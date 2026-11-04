@@ -50,6 +50,13 @@
       "when": 1793719330725,
       "tag": "0006_brief_morbius",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1793801481287,
+      "tag": "0007_wild_clea",
+      "breakpoints": true
     }
   ]
 }

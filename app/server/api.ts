@@ -259,7 +259,7 @@ export async function handleApi(request: Request, env: Bindings): Promise<Respon
     return reply({ error: "服务暂时不可用，请稍后重试" }, 500);
   }
 }
-type OjProblem = { checker: string; scoring: string; id: number; code: string; title: string; statement: string; editorial: string; editorial_published: number; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
+type OjProblem = { checker: string; scoring: string; id: number; code: string; title: string; statement: string; editorial: string; editorial_published: number; difficulty: number; difficulty_tier: number; quality: number; quality_note: string; samples: string; time_limit: number; memory_limit: number; published: number; revision: number; created_at: string; updated_at: string };
 type OjFile = { id: string; user_id: number; name: string; size: number };
 type OjCase = { group?: number; input: string; output: string; weight: number; position: number; input_file?: string | null; output_file?: string | null; input_size?: number; output_size?: number; input_name?: string | null; output_name?: string | null };
 const MAX_FILE = 16 * 1024 * 1024;
@@ -277,7 +277,16 @@ function plainText(value: unknown, label: string, max: number) {
   if (typeof value !== "string" || value.length > max) throw new ApiError(400, label + "格式不正确或过长");
   return value;
 }
-async function ojInput(value: Record<string, unknown>, db: D1Database) {
+function ojAssessment(value: Record<string, unknown>, previous?: OjProblem) {
+  const difficulty = integer(value.difficulty === undefined ? previous?.difficulty ?? 0 : value.difficulty, "难度", 0, 7);
+  const defaultTier = difficulty ? previous?.difficulty_tier || 2 : 0;
+  const difficulty_tier = integer(value.difficulty_tier === undefined ? defaultTier : value.difficulty_tier, "难度档位", 0, 3);
+  if (Boolean(difficulty) !== Boolean(difficulty_tier)) throw new ApiError(400, "请为已评定难度选择下位、中位或上位");
+  const quality = integer(value.quality === undefined ? previous?.quality ?? 0 : value.quality, "质量等级", 0, 4);
+  const quality_note = field(value.quality_note === undefined ? previous?.quality_note ?? "" : value.quality_note, "质量简评", 1000, false);
+  return { difficulty, difficulty_tier, quality, quality_note };
+}
+async function ojInput(value: Record<string, unknown>, db: D1Database, previous?: OjProblem) {
   const checker = value.checker ?? "text", scoring = value.scoring ?? "weighted";
   if (!["text", "casefold"].includes(String(checker)) || !["weighted", "all", "groups"].includes(String(scoring))) throw new ApiError(400, "评测规则不正确");
   const code = field(value.code, "题号", 24).toUpperCase();
@@ -318,7 +327,7 @@ async function ojInput(value: Record<string, unknown>, db: D1Database) {
     total += size;
   }
   if (total > MAX_DATA) throw new ApiError(400, "测试数据合计不能超过 256 MiB");
-  return { code, title, statement, time_limit, memory_limit, checker: String(checker), scoring: String(scoring), published: value.published ? 1 : 0, samples: JSON.stringify(samples), cases };
+  return { ...ojAssessment(value, previous), code, title, statement, time_limit, memory_limit, checker: String(checker), scoring: String(scoring), published: value.published ? 1 : 0, samples: JSON.stringify(samples), cases };
 }
 function splitDraftEditorial(statement: string) {
   const marker = "\n\n:::info[出题备忘 · 公开前移除]\n";
@@ -557,25 +566,33 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
   if (path === "problems" && request.method === "GET") {
     const all = url.searchParams.get("all") === "1";
     if (all) requireSuper();
-    const rows = await db.prepare("SELECT id,code,title,time_limit,memory_limit,published,revision,created_at FROM oj_problems" + (all ? "" : " WHERE published=1") + " ORDER BY id LIMIT 200").all();
+    const rows = await db.prepare("SELECT id,code,title,time_limit,memory_limit,published,difficulty,difficulty_tier,quality,revision,created_at FROM oj_problems" + (all ? "" : " WHERE published=1") + " ORDER BY id LIMIT 200").all();
     return reply({ problems: rows.results.map((p) => ({ ...p, published: Boolean(p.published) })) });
   }
   if (path === "problems" && request.method === "POST") {
     requireSuper();
     const p = await ojInput(await body(request), db);
     if (await db.prepare("SELECT id FROM oj_problems WHERE code=?").bind(p.code).first()) throw new ApiError(409, "题号已存在");
-    const row = await db.prepare("INSERT INTO oj_problems(code,title,statement,samples,time_limit,memory_limit,published,created_at,updated_at,checker,scoring) VALUES(?,?,?,?,?,?,0,?,?,?,?) RETURNING *").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, stamp, stamp, p.checker, p.scoring).first<OjProblem>();
+    const row = await db.prepare("INSERT INTO oj_problems(code,title,statement,samples,time_limit,memory_limit,published,created_at,updated_at,checker,scoring,difficulty,difficulty_tier,quality,quality_note) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?,?) RETURNING *").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, stamp, stamp, p.checker, p.scoring, p.difficulty, p.difficulty_tier, p.quality, p.quality_note).first<OjProblem>();
     if (!row) throw new ApiError(500, "题目保存失败");
     await db.batch([...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), row.id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1)), db.prepare("UPDATE oj_problems SET published=? WHERE id=?").bind(p.published, row.id)]);
     return reply({ problem: publicProblem({ ...row, published: p.published }) }, 201);
   }
-  const pm = path.match(/^problems\/([1-9]\d{0,8})(\/editorial)?$/);
+  const pm = path.match(/^problems\/([1-9]\d{0,8})(\/editorial|\/assessment)?$/);
   if (pm) {
     const id = Number(pm[1]);
     if (request.method !== "GET") requireSuper();
     const row = await db.prepare("SELECT * FROM oj_problems WHERE id=?").bind(id).first<OjProblem>();
     if (!row || (!row.published && !superuser(user))) throw new ApiError(404, "题目不存在");
-    if (pm[2]) {
+    if (pm[2] === "/assessment") {
+      if (request.method !== "PATCH") throw new ApiError(404, "接口不存在");
+      const a = ojAssessment(await body(request), row);
+      const saved = await db.prepare("UPDATE oj_problems SET difficulty=?,difficulty_tier=?,quality=?,quality_note=?,updated_at=? WHERE id=? RETURNING *")
+        .bind(a.difficulty, a.difficulty_tier, a.quality, a.quality_note, stamp, id).first<OjProblem>();
+      if (!saved) throw new ApiError(404, "题目不存在");
+      return reply({ problem: publicProblem(saved, true) });
+    }
+    if (pm[2] === "/editorial") {
       if (request.method !== "PATCH") throw new ApiError(404, "接口不存在");
       const value = await body(request);
       const editorial = field(value.editorial, "题解", 100000, false);
@@ -595,10 +612,10 @@ async function handleOj(request: Request, env: Bindings, db: D1Database, user: A
       return reply({ problem: publicProblem(row, superuser(user)) });
     }
     if (request.method === "PATCH") {
-      const p = await ojInput(await body(request), db);
+      const p = await ojInput(await body(request), db, row);
       const other = await db.prepare("SELECT id FROM oj_problems WHERE code=? AND id<>?").bind(p.code, id).first();
       if (other) throw new ApiError(409, "题号已存在");
-      await db.batch([db.prepare("UPDATE oj_problems SET code=?,title=?,statement=?,samples=?,time_limit=?,memory_limit=?,published=?,checker=?,scoring=?,revision=revision+1,updated_at=? WHERE id=?").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, p.published, p.checker, p.scoring, stamp, id), db.prepare("DELETE FROM oj_cases WHERE problem_id=?").bind(id), ...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1))]);
+      await db.batch([db.prepare("UPDATE oj_problems SET code=?,title=?,statement=?,samples=?,time_limit=?,memory_limit=?,published=?,checker=?,scoring=?,difficulty=?,difficulty_tier=?,quality=?,quality_note=?,revision=revision+1,updated_at=? WHERE id=?").bind(p.code, p.title, p.statement, p.samples, p.time_limit, p.memory_limit, p.published, p.checker, p.scoring, p.difficulty, p.difficulty_tier, p.quality, p.quality_note, stamp, id), db.prepare("DELETE FROM oj_cases WHERE problem_id=?").bind(id), ...p.cases.map((c) => db.prepare("INSERT INTO oj_cases(id,problem_id,position,input,output,weight,input_file,output_file,group_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(crypto.randomUUID(), id, c.position, c.input, c.output, c.weight, c.input_file || null, c.output_file || null, c.group || 1))]);
       return reply({ problem: publicProblem({ ...row, ...p, revision: row.revision + 1, updated_at: stamp }) });
     }
   }

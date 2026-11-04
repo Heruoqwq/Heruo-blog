@@ -189,6 +189,44 @@ test('Concurrent same-name registrations have one winner and neither can claim I
 });
 const {judgeSummary}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
 const ojProblem={code:'TEST1',title:'Secret tests',statement:'A **problem** with $x$.',samples:[{input:'public sample\n',output:'public result\n'}],time_limit:1000,memory_limit:256,published:true,cases:[{input:'HIDDEN_INPUT_ONE\n',output:'HIDDEN_OUTPUT_ONE\n',weight:3},{input:'HIDDEN_INPUT_TWO\n',output:'HIDDEN_OUTPUT_TWO\n',weight:1}]};
+test('OJ assessments validate difficulty tiers and quality, preserve legacy edits, and do not revise judging data',async(t)=>{
+ const {request,owner,register}=setup(t);
+ const admin=await owner(), member=await register('Alice');
+ const made=await request('oj/problems','POST',ojProblem,admin.token);
+ assert.equal(made.status,201);
+ const id=made.data.problem.id, route='oj/problems/'+id;
+ const before=(await request(route+'?edit=1','GET',undefined,admin.token)).data.problem;
+ assert.equal(before.difficulty,0);
+ assert.equal(before.difficulty_tier,0);
+ assert.equal(before.quality,0);
+ assert.equal(before.quality_note,'');
+ const assessment={difficulty:6,difficulty_tier:3,quality:3,quality_note:'核心明确，适合训练。'};
+ assert.equal((await request(route+'/assessment','PATCH',assessment)).status,401);
+ assert.equal((await request(route+'/assessment','PATCH',assessment,member.token)).status,403);
+ const changed=await request(route+'/assessment','PATCH',assessment,admin.token);
+ assert.equal(changed.status,200);
+ for(const [key,value] of Object.entries(assessment))assert.equal(changed.data.problem[key],value);
+ const after=(await request(route+'?edit=1','GET',undefined,admin.token)).data.problem;
+ assert.equal(after.revision,before.revision);
+ assert.deepEqual(after.cases,before.cases);
+ assert.equal(after.published,true);
+ const listed=(await request('oj/problems')).data.problems.find(p=>p.id===id);
+ assert.equal(listed.difficulty,6);
+ assert.equal(listed.difficulty_tier,3);
+ assert.equal(listed.quality,3);
+ for(const patch of [{difficulty:8},{difficulty:1.5},{difficulty:null},{difficulty_tier:4},{difficulty_tier:0},{quality:5},{quality:-1},{quality_note:'x'.repeat(1001)},{difficulty:0,difficulty_tier:1}]){
+  assert.equal((await request(route+'/assessment','PATCH',patch,admin.token)).status,400,JSON.stringify(patch));
+ }
+ const legacy=await request(route,'PATCH',ojProblem,admin.token);
+ assert.equal(legacy.status,200);
+ for(const [key,value] of Object.entries(assessment))assert.equal(legacy.data.problem[key],value);
+ assert.equal((await request(route,'PATCH',{...ojProblem,published:false},admin.token)).status,200);
+ assert.equal((await request(route)).status,404);
+ assert.equal((await request(route+'/assessment','PATCH',{quality:4},member.token)).status,403);
+ const reset=await request(route+'/assessment','PATCH',{difficulty:0,difficulty_tier:0,quality:0,quality_note:''},admin.token);
+ assert.equal(reset.status,200);
+ assert.equal(reset.data.problem.difficulty,0);
+});
 test('OJ editorials keep drafts private and can migrate a legacy note without touching judging data',async(t)=>{
  const {request,register,owner,sqlite}=setup(t);
  const admin=await owner(), member=await register('Alice');
