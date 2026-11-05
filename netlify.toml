@@ -1,0 +1,21 @@
+[build]
+  base = "mirror"
+  command = "node build.mjs"
+  publish = "dist"
+[build.environment]
+  NODE_VERSION = "22"
+[[edge_functions]]
+  function = "api"
+  path = "/api"
+[[edge_functions]]
+  function = "api"
+  path = "/api/*"
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"

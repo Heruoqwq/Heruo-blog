@@ -1,0 +1,7 @@
+{
+  "name": "heruo-oj-free-entry",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node build.mjs", "test": "node --test test.mjs" },
+  "engines": { "node": ">=22" }
+}
